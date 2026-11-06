@@ -1,0 +1,489 @@
+"""2026-10-25 审计 P2 低风险批次回归。
+
+覆盖：
+- P2-2：备份还原不再回退到裸 extractall（路径穿越防护不能降级）
+- P2-4：启动日志不打印 session token 片段
+- P2-15：Win32 DPI 上下文按指针宽度声明（见 test_copilot_win32 的签名断言）
+- P2-19：买家类型 option 的 value 固定中文（见 tests_js）
+- P2-26：对话 limit 夹在 1～200；CSV 读完后再校验实际大小
+- P2-1：插件工具错误不把 traceback 返回给 LLM
+"""
+
+from __future__ import annotations
+
+import io
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from fastapi import HTTPException
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+
+def _read_source(rel: str) -> str:
+    return (ROOT / rel).read_text(encoding="utf-8")
+
+
+class TestRestoreNoUnsafeFallback:
+    def test_extractall_always_uses_data_filter(self):
+        src = _read_source("trade/post_install/backup.py")
+        extract_at = src.index("tar.extractall")
+        around = src[max(0, extract_at - 600): extract_at + 200]
+        assert 'filter="data"' in around
+        # 不许再有 `except TypeError: tar.extractall(...)` 这种降级
+        assert "except TypeError" not in around
+        # 全文件只应有一处 extractall 调用
+        assert src.count("tar.extractall") == 1
+
+
+class TestCustomsSkillConsistency:
+    """Batch 4B/4C/4D：注入与正文对齐、无品类专用规则、模板不冒充海关数据。"""
+
+    def _text(self) -> str:
+        return (ROOT / "skills" / "b2b-customs-data" / "SKILL.md").read_text(
+            encoding="utf-8",
+        )
+
+    def test_injection_and_body_carry_new_rules(self):
+        import re
+
+        import yaml
+
+        text = self._text()
+        fm = yaml.safe_load(re.match(r"^---\n(.*?)\n---\n", text, re.S).group(1))
+        ip = fm["injection_prompt"]
+        body = text.split("---", 2)[2]
+
+        for kw in (
+            "目标是人时", "用户提供 CSV/Excel 时", "实体分层",
+            "百分比口径", "品类判断", "输出格式（强制）",
+        ):
+            assert kw in ip, f"注入缺少：{kw}"
+        for kw in ("目标是人时", "实体分层", "百分比口径", "品类判断", "输出格式"):
+            assert kw in body, f"正文缺少：{kw}"
+
+    def test_no_category_specific_hs_pair(self):
+        """按 Lau 口径：不在 skill 里写死单一品类 / HS 编码对。"""
+        text = self._text()
+        assert "8546" not in text
+        assert "8547" not in text
+
+    def test_phase6_template_does_not_claim_customs_data(self):
+        text = self._text()
+        assert "Public records show" in text
+        assert "Your import data shows" not in text
+
+
+class TestUserPathsWiring:
+    def test_chat_endpoints_bind_user_paths(self):
+        """W7：两个聊天端点都要把用户贴出的路径传给守卫（仅本轮）。"""
+        src = _read_source("trade/api/chat.py")
+        assert src.count("_classify_user_paths(query, cid)") == 2
+        assert src.count("user_paths=user_paths") == 2
+        # 2026-10-29：贴出即授权，不再有「待确认」清单
+        assert "pending_paths" not in src
+        assert "_external_paths_hint" in src
+        assert "不要复述密码、密钥、token 原文" in src
+
+
+class TestStatusExposesToolGuard:
+    def test_status_reports_tool_guard(self):
+        """守卫状态仍上报 /api/status（诊断用，前端不再据此弹 toast）。"""
+        src = _read_source("trade/app.py")
+        assert '"tool_guard": tool_guard' in src
+        assert "verify_tool_guard_ready" in src
+
+    def test_chat_gate_never_blocks(self):
+        """2026-10-29 起门控恒放行：两处调用点保留，但函数体只剩 return None。"""
+        src = _read_source("trade/api/chat.py")
+        assert src.count("tool_guard_chat_block_reason()") == 2
+        boot = _read_source("trade/bootstrap.py")
+        start = boot.index("def tool_guard_chat_block_reason() -> str | None:")
+        body = boot[start : boot.index("\n\ndef ", start)]
+        # 不再读任何状态、不再拼阻断文案，函数体只剩一条 return None
+        assert "state[" not in body
+        assert "聊天已暂停" not in body
+        assert body.rstrip().endswith("return None")
+
+
+class TestTokenNotLogged:
+    def test_startup_log_has_no_token_fragment(self):
+        src = _read_source("trade/app.py")
+        assert "_SESSION_TOKEN[:8]" not in src
+        assert "Session token 已生成" in src
+
+
+class TestConversationLimitClamp:
+    @pytest.mark.parametrize("raw,expected", [(-1, 1), (0, 1), (99999, 200), (50, 50)])
+    def test_limit_is_clamped(self, raw, expected):
+        import trade.api.conversations as conv_api
+
+        seen = []
+        with patch.object(
+            conv_api.chat_memory, "list_by_company",
+            side_effect=lambda cid, limit: seen.append(limit) or [],
+        ):
+            conv_api.list_conversations(limit=raw, x_company_id=1)
+
+        assert seen == [expected]
+
+
+class TestUploadLimits:
+    def test_file_count_and_total_size_limits(self):
+        """P2-26 剩余：上传要有文件数/总量上限，不只单文件 100MB。"""
+        src = _read_source("trade/api/libraries.py")
+        assert "_MAX_FILES_PER_UPLOAD" in src
+        assert "_MAX_TOTAL_BYTES" in src
+        assert "total_uploaded_bytes" in src
+
+
+class TestPromptUsesRealToolNames:
+    def test_no_list_files_in_prompts(self):
+        """Hermes 没有 list_files 工具；旧提示词让模型调一个不存在的工具。"""
+        src = _read_source("trade/helpers.py")
+        assert "list_files" not in src
+        assert "search_files" in src
+
+
+class TestUpdateNeedsConfirmHeader:
+    def test_backend_rejects_update_without_confirm_header(self):
+        """前端 confirm() 只是浏览器层，后端必须再挡一道（审计 P1-10）。"""
+        src = _read_source("trade/app.py")
+        assert "X-Confirm-Update" in src
+        assert 'request.headers.get("X-Confirm-Update"' in src
+
+    def test_update_does_not_auto_restart(self):
+        """更新只拉取+装依赖，不自动重启（P1-10 的安全替代方案）。"""
+        src = _read_source("trade/app.py")
+        assert "background_tasks.add_task(_perform_restart)" not in src
+        assert 'result["restart_scheduled"] = False' in src
+
+
+class TestBlockedSkillPurge:
+    def test_stale_blocked_skill_dir_is_removed(self, tmp_path):
+        """源目录里已经没有该 skill 时，Hermes 侧的残留也必须清掉（P1-13）。"""
+        from trade.post_install.skills import _purge_blocked_skills
+
+        skills_dir = tmp_path / "skills"
+        stale = skills_dir / "auto-smtp-email"
+        stale.mkdir(parents=True)
+        (stale / "SKILL.md").write_text("x", encoding="utf-8")
+
+        _purge_blocked_skills(skills_dir)
+
+        assert not stale.exists()
+
+    def test_skill_prompt_is_disabled(self):
+        skill = (ROOT / "skills" / "auto-smtp-email" / "SKILL.md").read_text(
+            encoding="utf-8",
+        )
+        assert "已被 Trade 停用" in skill
+        assert "import smtplib" not in skill, "停用 skill 不应保留可执行发信代码"
+
+    def test_registry_augment_is_disabled(self):
+        """registry 的 augment_prompt 也是可达路径，不能留完整发送说明。"""
+        from trade.skill_registry import get_skill_by_name
+
+        skill = get_skill_by_name("auto-smtp-email")
+        augment = skill["augment_prompt"]
+        assert "已被 Trade 停用" in augment
+        assert "禁止调用 SMTP" in augment
+        # 不允许残留可执行的发送流程/凭证读取路径
+        assert "SMTP_SSL" not in augment
+        assert "starttls" not in augment
+        assert "~/.hermes/.env" not in augment
+        assert "60-120 秒" not in augment
+        assert "send_log" not in augment
+
+    def test_orchestrator_does_not_instruct_calling_it(self):
+        """编排器 SKILL.md 不能被教"确认后调用 auto-smtp-email"。"""
+        skill = (ROOT / "skills" / "auto-trade-customer-development" / "SKILL.md").read_text(
+            encoding="utf-8",
+        )
+        assert "确认后调用 auto-smtp-email" not in skill
+        assert "SMTP_HOST" not in skill
+        assert "不发送任何邮件" in skill
+        # description 的流程也不能写"发送"（审计附录四）
+        description = next(
+            line for line in skill.splitlines() if line.startswith("description:")
+        )
+        assert "发送" not in description
+        assert "交付草稿" in description
+
+    def test_startup_sync_purges_and_skips_blocked(self, tmp_path, monkeypatch):
+        """启动同步也要清残留、且不复制停用 skill（P1-13 时间窗口）。"""
+        import types
+
+        import trade.bootstrap as bootstrap
+
+        hermes_home = tmp_path / "hermes"
+        stale = hermes_home / "skills" / "auto-smtp-email"
+        stale.mkdir(parents=True)
+        (stale / "SKILL.md").write_text("old", encoding="utf-8")
+
+        trade_home = tmp_path / "trade-home"
+        skills_src = trade_home / "foreign-trade-assistant" / "skills"
+        (skills_src / "b2b-demo").mkdir(parents=True)
+        (skills_src / "b2b-demo" / "SKILL.md").write_text("demo", encoding="utf-8")
+        (skills_src / "auto-smtp-email").mkdir(parents=True)
+        (skills_src / "auto-smtp-email" / "SKILL.md").write_text("stub", encoding="utf-8")
+
+        stub = types.ModuleType("hermes_constants")
+        stub.get_hermes_home = lambda: hermes_home
+        monkeypatch.setitem(sys.modules, "hermes_constants", stub)
+        monkeypatch.setenv("TRADE_HOME", str(trade_home))
+
+        bootstrap._local_skills_sync()
+
+        assert not (hermes_home / "skills" / "auto-smtp-email").exists()
+        assert (hermes_home / "skills" / "b2b-demo" / "SKILL.md").is_file()
+
+
+class TestSkillSyncManifest:
+    def test_manifest_records_hashes_and_skips_blocked(self, tmp_path):
+        """P2-3：同步后至少留下哈希台账，且不记录停用 skill。"""
+        import json
+
+        from trade.post_install.skills import _write_skill_manifest
+
+        (tmp_path / "b2b-demo").mkdir()
+        (tmp_path / "b2b-demo" / "SKILL.md").write_text("demo", encoding="utf-8")
+        (tmp_path / "auto-smtp-email").mkdir()
+        (tmp_path / "auto-smtp-email" / "SKILL.md").write_text("bad", encoding="utf-8")
+
+        _write_skill_manifest(tmp_path)
+
+        data = json.loads((tmp_path / ".sync-manifest.json").read_text(encoding="utf-8"))
+        assert "b2b-demo/SKILL.md" in data["files"]
+        assert "auto-smtp-email/SKILL.md" not in data["files"]
+        assert len(data["files"]["b2b-demo/SKILL.md"]) == 64
+
+
+class TestSkillManifestVerify:
+    """W5：清单能验、覆盖 references、安装路径不丢条目、有历史与自哈希。"""
+
+    def _mk(self, tmp_path, name="b2b-a"):
+        d = tmp_path / name
+        (d / "references").mkdir(parents=True)
+        (d / "SKILL.md").write_text("demo", encoding="utf-8")
+        (d / "references" / "qa_pairs.md").write_text("qa", encoding="utf-8")
+        return d
+
+    def test_manifest_covers_references_and_history(self, tmp_path):
+        import json
+
+        from trade.post_install.skills import _write_skill_manifest
+
+        self._mk(tmp_path)
+        _write_skill_manifest(tmp_path)
+
+        data = json.loads((tmp_path / ".sync-manifest.json").read_text(encoding="utf-8"))
+        assert "b2b-a/SKILL.md" in data["files"]
+        assert "b2b-a/references/qa_pairs.md" in data["files"]
+        assert isinstance(data["history"], list) and data["history"]
+        assert len(data["manifest_hash"]) == 64
+
+    def test_install_path_does_not_drop_existing_entries(self, tmp_path):
+        """只传本次 installed 也不能丢目录里已有的 skill。"""
+        import json
+
+        from trade.post_install.skills import _write_skill_manifest
+
+        self._mk(tmp_path, "b2b-a")
+        self._mk(tmp_path, "b2b-b")
+        _write_skill_manifest(tmp_path, ["b2b-a"])
+
+        data = json.loads((tmp_path / ".sync-manifest.json").read_text(encoding="utf-8"))
+        assert "b2b-a/SKILL.md" in data["files"]
+        assert "b2b-b/SKILL.md" in data["files"]
+
+    def test_copy_skills_keeps_preexisting_manifest_entries(self, tmp_path):
+        """安装路径（_copy_skills）也要全扫，不能只记本次 installed。"""
+        import json
+
+        from trade.post_install.skills import _copy_skills
+
+        src = tmp_path / "src"
+        (src / "b2b-a").mkdir(parents=True)
+        (src / "b2b-a" / "SKILL.md").write_text("a", encoding="utf-8")
+        dst = tmp_path / "dst"
+        (dst / "b2b-b").mkdir(parents=True)
+        (dst / "b2b-b" / "SKILL.md").write_text("b", encoding="utf-8")
+
+        _copy_skills(src, dst)
+
+        data = json.loads((dst / ".sync-manifest.json").read_text(encoding="utf-8"))
+        assert "b2b-a/SKILL.md" in data["files"]
+        assert "b2b-b/SKILL.md" in data["files"]
+
+    def test_verify_ok_after_write(self, tmp_path):
+        from trade.post_install.skills import (
+            _write_skill_manifest,
+            verify_skill_manifest,
+        )
+
+        self._mk(tmp_path)
+        _write_skill_manifest(tmp_path)
+        assert verify_skill_manifest(tmp_path)["ok"] is True
+
+    def test_verify_detects_added_reference(self, tmp_path):
+        from trade.post_install.skills import (
+            _write_skill_manifest,
+            verify_skill_manifest,
+        )
+
+        self._mk(tmp_path)
+        _write_skill_manifest(tmp_path)
+        (tmp_path / "b2b-a" / "references" / "new.md").write_text("x", encoding="utf-8")
+
+        report = verify_skill_manifest(tmp_path)
+        assert report["ok"] is False
+        assert "b2b-a/references/new.md" in report["missing_in_manifest"]
+
+    def test_verify_detects_history_tamper(self, tmp_path):
+        import json
+
+        from trade.post_install.skills import (
+            _write_skill_manifest,
+            verify_skill_manifest,
+        )
+
+        self._mk(tmp_path)
+        _write_skill_manifest(tmp_path)
+        path = tmp_path / ".sync-manifest.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["history"][0]["file_count"] = 999
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        report = verify_skill_manifest(tmp_path)
+        assert report["ok"] is False
+        assert report["reason"] == "history_chain_mismatch"
+
+    def test_verify_detects_tampered_middle_history_entry(self, tmp_path):
+        """篡改**中间**一条（不是最新条）必须断链。"""
+        import json
+
+        from trade.post_install.skills import (
+            _write_skill_manifest,
+            verify_skill_manifest,
+        )
+
+        self._mk(tmp_path)
+        for _ in range(3):
+            _write_skill_manifest(tmp_path)
+
+        path = tmp_path / ".sync-manifest.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        middle = len(data["history"]) // 2
+        data["history"][middle]["manifest_hash"] = "0" * 64
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        report = verify_skill_manifest(tmp_path)
+        assert report["ok"] is False
+        assert report["reason"] == "history_chain_mismatch"
+
+    def test_history_truncation_keeps_chain_valid(self, tmp_path):
+        import json
+
+        from trade.post_install.skills import (
+            _write_skill_manifest,
+            verify_skill_manifest,
+        )
+
+        self._mk(tmp_path)
+        for _ in range(21):
+            _write_skill_manifest(tmp_path)
+
+        data = json.loads((tmp_path / ".sync-manifest.json").read_text(encoding="utf-8"))
+        assert len(data["history"]) == 20
+        assert data["history_anchor"], "截断后必须保留链头锚点"
+        assert verify_skill_manifest(tmp_path)["ok"] is True
+
+    def test_verify_detects_tampered_manifest(self, tmp_path):
+        import json
+
+        from trade.post_install.skills import (
+            _write_skill_manifest,
+            verify_skill_manifest,
+        )
+
+        self._mk(tmp_path)
+        _write_skill_manifest(tmp_path)
+        path = tmp_path / ".sync-manifest.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["files"]["b2b-a/SKILL.md"] = "0" * 64  # 篡改哈希
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        report = verify_skill_manifest(tmp_path)
+        assert report["ok"] is False
+        assert report["reason"] == "self_hash_mismatch"
+
+
+class TestLicenseRoutesRequireSession:
+    def test_router_has_session_dependency(self):
+        src = _read_source("trade/api/license.py")
+        assert "dependencies=[Depends(require_session)]" in src
+        assert "不需要 session token" not in src
+
+    def test_frontend_sends_token(self):
+        js = _read_source("static/trade_chat.js")
+        assert js.count("'/api/trade/license/status', _buildApiOpts('GET', null, TOKEN, currentCompanyId)") >= 2
+        assert "_buildApiOpts('POST', {code}, TOKEN, currentCompanyId)" in js
+
+
+class TestConversationSaveScope:
+    def test_foreign_library_is_rejected(self):
+        """与 /chat 的 _validate_scope 对齐：库里没有这个库就不能按它存行。"""
+        import trade.api.conversations as conv_api
+        from trade.api.models import ConversationSave
+
+        with patch.object(conv_api.library_module, "get", return_value=None):
+            with pytest.raises(HTTPException) as exc:
+                conv_api.save_conversation(
+                    ConversationSave(query="q", response="r", library_id=99),
+                    x_company_id=1,
+                )
+
+        assert exc.value.status_code == 400
+        assert "Library" in exc.value.detail
+
+
+class TestCsvSizeAfterRead:
+    @pytest.mark.asyncio
+    async def test_chunked_upload_over_limit_rejected(self):
+        """file.size 为 None（分块上传）时，读完必须按实际字节数拒绝。"""
+        from starlette.datastructures import UploadFile
+
+        import trade.api.customers as cust_api
+
+        payload = b"name\n" + b"x" * (10 * 1024 * 1024 + 1)
+        upload = UploadFile(file=io.BytesIO(payload), filename="big.csv")
+        assert getattr(upload, "size", None) is None
+
+        with pytest.raises(HTTPException) as exc:
+            await cust_api.bulk_import_customers(upload, cid=1)
+
+        assert exc.value.status_code == 413
+
+
+class TestPluginDoesNotLeakTraceback:
+    def test_error_returns_exception_type_only(self):
+        import trade.chat_memory as chat_memory
+        import trade.hermes_chat_memory_plugin.tools as tools
+        from trade.agent_context import bind_company
+
+        def boom(**_kw):
+            raise RuntimeError("db exploded at /Users/secret/trade.db")
+
+        with bind_company(1, None), patch.object(chat_memory, "search_history", boom):
+            result = tools.handle_chat_memory_list(
+                {"company_id": 1, "time_range": "all"}
+            )
+
+        text = str(result)
+        assert "RuntimeError" in text, "应保留异常类型，便于 LLM 向用户解释"
+        assert "/Users/secret" not in text, "内部路径不得返回给 LLM"
+        assert "Traceback" not in text

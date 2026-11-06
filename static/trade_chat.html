@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" type="image/png" href="/static/trade-icon.png">
+<title>路路通ai助手</title>
+<!-- 本地打包（审计 P2-23）：离线也能渲染 markdown / 做 XSS 清洗，不再依赖 CDN。
+     注意：**不要**给同源本地文件加 integrity（SRI）。SRI 防的是第三方 CDN 被投毒；
+     能改本地文件的人已经拿下机器，没有安全收益。而哈希按 LF 字节计算，
+     Windows 检出（core.autocrlf）把文件转成 CRLF 后校验必失败 → 脚本被拒绝执行
+     → marked/DOMPurify 为 undefined → 发消息静默失败（2026-10-29 实测事故）。 -->
+<script src="/static/vendor/marked.umd.js"></script>
+<script src="/static/vendor/purify.min.js"></script>
+<script>marked.setOptions({ breaks: true, gfm: true });</script>
+<link rel="stylesheet" href="/static/trade_chat.css">
+<body>
+
+<!-- ═════════════════════ SIDEBAR ═════════════════════ -->
+<aside class="sidebar">
+    <div class="sidebar-header">
+        <div class="logo-row">
+            <div class="logo">📦 路路通ai助手</div>
+            <select id="lang-select" aria-label="Language" onchange="switchLang(this.value)" class="lang-select">
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+            </select>
+        </div>
+        <div class="company-select">
+            <div class="csel-row">
+                <select id="company-select" aria-label="选择公司" onchange="onCompanyChange(this.value)">
+                    <option value="">— 选择公司 —</option>
+                </select>
+                <button onclick="showAddCompanyModal()" title="添加公司">+</button>
+            </div>
+        </div>
+    </div>
+
+    <nav class="sidebar-nav">
+        <div class="nav-section">
+            <div class="nav-section-title">📊 工作台</div>
+            <div class="nav-item active" data-view="chat" data-chat-context="daily" onclick="navToView('chat','daily','今日简报')">
+                <span class="nav-icon">📋</span><span class="nav-label">今日简报</span>
+            </div>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-section-title">🔍 获客引流</div>
+            <div class="nav-item" data-view="chat" data-chat-context="lead" onclick="navToView('chat','lead','客户开发')">
+                <span class="nav-icon">🎯</span><span class="nav-label">客户开发</span>
+            </div>
+            <div class="nav-item" data-view="chat" data-chat-context="platform" onclick="navToView('chat','platform','平台诊断')">
+                <span class="nav-icon">🏪</span><span class="nav-label">网站诊断</span>
+            </div>
+            <div class="nav-item" data-view="chat" data-chat-context="social" onclick="navToView('chat','social','社媒营销')">
+                <span class="nav-icon">📱</span><span class="nav-label">社媒营销</span>
+            </div>
+            <div class="nav-item" data-view="chat" data-chat-context="linkedin" onclick="navToView('chat','linkedin','LinkedIn 营销')">
+                <span class="nav-icon">💼</span><span class="nav-label">LinkedIn</span>
+            </div>
+            <div class="nav-item" data-view="chat" data-chat-context="customs" onclick="navToView('chat','customs','海关数据')">
+                <span class="nav-icon">🛃</span><span class="nav-label">海关数据</span>
+            </div>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-section-title">👤 销售转化</div>
+            <div class="nav-item" data-view="customers" onclick="navToView('customers')">
+                <span class="nav-icon">👥</span><span class="nav-label">客户管理</span>
+            </div>
+            <div class="nav-item" data-view="chat" data-chat-context="docs" onclick="navToView('chat','docs','文档库')">
+                <span class="nav-icon">📁</span><span class="nav-label">文档库</span>
+            </div>
+            <div class="nav-item" data-view="chat" data-chat-context="docgen" onclick="navToView('chat','docgen','文档生成')">
+                <span class="nav-icon">📄</span><span class="nav-label">文档生成</span>
+            </div>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-section-title">🛠️ 工具</div>
+            <div class="nav-item" data-view="chat" data-chat-context="osint" onclick="navToView('chat','osint','客户背调')">
+                <span class="nav-icon">🕵️</span><span class="nav-label">客户背调</span>
+            </div>
+            <div class="nav-item" data-view="tasks" onclick="navToView('tasks')">
+                <span class="nav-icon">⏰</span><span class="nav-label">定时任务</span>
+            </div>
+        </div>
+
+        <div class="nav-section">
+            <div class="nav-section-title">💬 历史</div>
+            <div class="nav-item" data-view="history" onclick="navToView('history')">
+                <span class="nav-icon">🕐</span><span class="nav-label">对话记录</span>
+            </div>
+        </div>
+    </nav>
+
+    <div id="license-bar" style="padding:6px 16px;font-size:11px;text-align:center;display:none;"></div>
+    <!-- 图标按钮：文字改成悬停时用 data-tip 显示（样式见 trade_chat.css 的
+         .sidebar-footer，文案由 trade_chat.js 的 applyI18n 填）。
+         带文字的按钮一行放不下 4 个，会被挤成两行 —— 图标加悬停提示既放得下，
+         又不牺牲可发现性。
+         ⚠️ 按钮上**不能**再留 title 属性：它和自定义提示会同时弹出来。
+         图标刻意两两不同（⬆️/♻️、📖/📚、ℹ️），否则纯图标后用户分不清谁是谁。 -->
+    <!-- 今日 token 用量提示（审计 P1-16）：只展示，不拦聊天。
+         文案与配色由 trade_chat.js 的 loadUsageToday() 填。 -->
+    <div id="usage-today" class="usage-today" hidden></div>
+    <div class="sidebar-footer">
+        <button id="system-update-btn" onclick="doTradeUpdate(event)" data-tip="更新系统">⬆️</button>
+        <button id="system-restart-btn" onclick="doRestartTrade(event)" data-tip="重启" hidden>♻️</button>
+        <button id="skills-help-btn" onclick="showSkillsHelp()" data-tip="技能帮助">📖</button>
+        <button id="skills-update-btn" onclick="updateSkills(event)" data-tip="更新技能" hidden>📚</button>
+        <button id="upgrade-help-btn" onclick="showUpgradeHelp()" data-tip="升级说明">ℹ️</button>
+        <button id="onboarding-btn" onclick="restartOnboarding()" data-tip="新手引导">🎓</button>
+        <!-- 聊天副驾设置入口暂时隐藏（2026-11-06）；弹窗与接口保留，改回可见只需删掉 hidden。 -->
+        <button id="copilot-settings-btn" onclick="showCopilotSettings()" data-tip="聊天副驾" hidden>⚙️</button>
+    </div>
+
+</aside>
+
+<!-- ═════════════════════ MAIN ═════════════════════ -->
+<main class="main" id="main-content">
+    <!-- filled dynamically by navToView() -->
+</main>
+
+<!-- ═════════════════════ MODALS ═════════════════════ -->
+
+<!-- Copilot Settings Modal（默认关闭；未同意隐私说明不能开启） -->
+<div class="modal-backdrop hidden" id="copilot-settings-modal">
+    <div class="modal">
+        <h3>🪟 聊天副驾</h3>
+        <p style="font-size:12px;color:var(--text-muted);line-height:1.7;margin-bottom:12px;">
+            按热键读取当前聊天窗口的可见内容，生成回复草稿供你复制。副驾不会外发消息，
+            也不会操作微信/WhatsApp。<b>截图或剪贴板文本发给你配置的视觉模型做识别；识别出的文字与产品库摘录会发给你配置的对话模型生成草稿；不会自动转给未配置的其他服务商。</b>
+            密码管理器、网银/支付类应用在拒读名单内；剪贴板通道默认关闭。
+        </p>
+        <div class="form-group">
+            <label><input type="checkbox" id="copilot-consent" onchange="onCopilotConsentChange()">
+                我已阅读并同意上面的说明（隐私说明版本 <span id="copilot-required-version">1</span>）</label>
+        </div>
+        <div class="form-group">
+            <label><input type="checkbox" id="copilot-enabled" disabled> 开启聊天副驾（默认关闭）</label>
+        </div>
+        <div class="form-group">
+            <label><input type="checkbox" id="copilot-use-clipboard"> 允许读取剪贴板（默认关闭）</label>
+        </div>
+        <div class="form-group">
+            <label for="copilot-max-chars">剪贴板单次上限（字符，默认 3000）</label>
+            <input type="number" id="copilot-max-chars" min="1" value="3000">
+        </div>
+        <div class="form-group">
+            <label for="copilot-refused-apps">额外拒读应用（每行一个，可留空）</label>
+            <textarea id="copilot-refused-apps" rows="2" placeholder="例如：Acme Bank"></textarea>
+        </div>
+        <div class="form-group">
+            <label for="copilot-hotkey">全局热键</label>
+            <input type="text" id="copilot-hotkey" placeholder="ctrl+shift+space">
+        </div>
+        <p id="copilot-availability" style="font-size:12px;color:var(--text-muted);margin-bottom:12px;"></p>
+        <div class="form-actions">
+            <button class="btn" onclick="hideModal('copilot-settings-modal')">取消</button>
+            <button class="btn btn-primary" onclick="saveCopilotSettings()">保存</button>
+        </div>
+    </div>
+</div>
+
+<!-- Company Modal -->
+<div class="modal-backdrop hidden" id="company-modal">
+    <div class="modal wide">
+        <h3>🏢 公司设置</h3>
+        <div class="modal-tabs">
+            <button class="modal-tab active" onclick="switchModalTab('tab-companies')" id="tab-btn-companies">公司列表</button>
+            <button class="modal-tab" onclick="switchModalTab('tab-identity')" id="tab-btn-identity">Agent 身份</button>
+        </div>
+        <div id="tab-companies">
+            <div id="company-list-ui" style="margin-bottom:14px;"></div>
+            <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;">
+            <h4 style="font-size:13px;font-weight:600;margin-bottom:10px;">添加新公司</h4>
+            <div class="form-row">
+                <div class="form-group"><label for="co-name">公司名称 *</label><input type="text" id="co-name" placeholder="例如：我的外贸公司" oninput="autoSlug()"></div>
+                <div class="form-group"><label for="co-slug">Slug</label><input type="text" id="co-slug" readonly placeholder="自动生成" style="color:var(--text-muted);background:var(--bg-main);cursor:not-allowed;" title="由系统根据公司名称自动生成"></div>
+            </div>
+            <div class="form-row">
+                <div class="form-group"><label for="co-contact-name">联系人</label><input type="text" id="co-contact-name" placeholder="姓名"></div>
+                <div class="form-group"><label for="co-contact-email">邮箱</label><input type="email" id="co-contact-email" placeholder="email@example.com"></div>
+            </div>
+            <div class="form-group"><label for="co-website">网站</label><input type="text" id="co-website" placeholder="https://..."></div>
+            <div class="form-actions">
+                <button class="btn" onclick="hideModal('company-modal')">关闭</button>
+                <button class="btn btn-primary" onclick="createCompany()">创建公司</button>
+            </div>
+        </div>
+        <div id="tab-identity" class="hidden">
+            <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">配置当前选中公司的 AI Agent 身份。系统会在对话时注入此内容。</p>
+            <div class="form-group"><label for="identity-editor">Agent 身份 (Markdown)</label>
+            <textarea id="identity-editor" placeholder="粘贴 agent-identity.md 内容..."></textarea></div>
+            <div class="form-actions">
+                <button class="btn" onclick="hideModal('company-modal')">关闭</button>
+                <button class="btn btn-primary" onclick="saveCompanyIdentity()">保存</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Customer Modal (add/edit) -->
+<div class="modal-backdrop hidden" id="customer-modal">
+    <div class="modal">
+        <h3 id="customer-modal-title">添加客户</h3>
+        <input type="hidden" id="cust-edit-id">
+        <div class="form-group"><label for="cust-name">公司名称 *</label><input type="text" id="cust-name" placeholder="客户公司名称"></div>
+        <div class="form-row">
+            <div class="form-group"><label for="cust-contact">联系人</label><input type="text" id="cust-contact" placeholder="联系人姓名"></div>
+            <div class="form-group"><label for="cust-title">职位</label><input type="text" id="cust-title" placeholder="CEO / Purchasing Manager"></div>
+            <div class="form-group"><label for="cust-country">国家</label><input type="text" id="cust-country" placeholder="如 Italy"></div>
+        </div>
+        <div class="form-row">
+            <div class="form-group"><label for="cust-email">邮箱</label><input type="text" id="cust-email" placeholder="contact@company.com"></div>
+            <div class="form-group"><label for="cust-phone">电话</label><input type="text" id="cust-phone" placeholder="+1 555-0123"></div>
+        </div>
+        <div class="form-row">
+            <div class="form-group" style="flex:1;"><label for="cust-whatsapp">WhatsApp</label><input type="text" id="cust-whatsapp" placeholder="+1 555-0123"></div>
+        </div>
+        <div class="form-row">
+            <div class="form-group"><label for="cust-linkedin">LinkedIn URL</label><input type="text" id="cust-linkedin" placeholder="https://linkedin.com/..."></div>
+            <div class="form-group"><label for="cust-website">公司网站</label><input type="text" id="cust-website" placeholder="https://company.com"></div>
+        </div>
+        <div class="form-row">
+            <div class="form-group"><label for="cust-tier">客户等级</label><select id="cust-tier"><option value="">未分级</option><option value="A">A 级</option><option value="B">B 级</option><option value="C">C 级</option></select></div>
+            <div class="form-group"><label for="cust-buyer-type">买家类型</label><select id="cust-buyer-type"><option value="">未设置</option><option value="品牌商">品牌商</option><option value="分销商">分销商</option><option value="代理商">代理商</option><option value="安装商">安装商</option><option value="维保商">维保商</option><option value="同行">同行</option><option value="其他">其他</option></select></div>
+            <div class="form-group"><label for="cust-main-category">主营品类</label><input type="text" id="cust-main-category" placeholder="客户主营产品或行业"></div>
+            <div class="form-group"><label for="cust-backup-email">备用邮箱</label><input type="text" id="cust-backup-email" placeholder="backup@company.com"></div>
+        </div>
+        <div class="form-row">
+            <div class="form-group"><label for="cust-match-score">匹配度</label><select id="cust-match-score"><option value="0">未评分</option><option value="1">1 - 低</option><option value="2">2</option><option value="3">3 - 中</option><option value="4">4</option><option value="5">5 - 高</option></select></div>
+        </div>
+        <div class="form-group"><label for="cust-note">备注 / 跟进项目</label><textarea id="cust-note" placeholder="该联系人负责的项目、需求、注意事项等" style="min-height:80px;"></textarea></div>
+        <div class="form-group"><label for="cust-follow-up-note">AI 跟进建议</label><textarea id="cust-follow-up-note" placeholder="AI 基于客户画像自动生成的跟进策略..." style="min-height:60px;"></textarea></div>
+        <div class="form-actions">
+            <button class="btn" onclick="hideModal('customer-modal')">取消</button>
+            <button class="btn btn-primary" onclick="saveCustomer()">保存</button>
+        </div>
+    </div>
+</div>
+
+<!-- Library Modal (添加文档库) -->
+<div class="modal-backdrop hidden" id="library-modal">
+    <div class="modal">
+        <h3>📁 添加文档库</h3>
+        <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">将本地文件夹关联为文档库，Agent 可通过 read_file 读取其中的文件。</p>
+        <div class="form-group"><label for="lib-name">库名称 *</label><input type="text" id="lib-name" placeholder="例如：产品报价库"></div>
+        <div class="form-group"><label for="lib-path">文件夹路径 *</label><input type="text" id="lib-path" placeholder="/Users/xxx/Documents/客户资料"><p class="hint">📌 Mac: 文件夹上右键 → Option键 → 复制路径名</p></div>
+        <div class="form-group"><label for="lib-desc">描述</label><input type="text" id="lib-desc" placeholder="可选"></div>
+        <div class="form-actions">
+            <button class="btn" onclick="hideModal('library-modal')">取消</button>
+            <button class="btn btn-primary" onclick="createLibrary()">添加</button>
+        </div>
+    </div>
+</div>
+
+<!-- Upgrade Help Modal -->
+<div class="modal-backdrop hidden" id="upgrade-help-modal">
+    <div class="modal" style="max-width:580px;">
+        <h3>⬆️ 如何升级 路路通ai助手</h3>
+        <div style="line-height:1.8;font-size:14px;margin-bottom:16px;">
+            <p>通过 <strong>Hermes</strong>（AI 助手）来升级 路路通ai助手 是最简单的方式。Hermes 会自动执行所有更新命令，遇到报错会自行排查重试。</p>
+            <h4 style="margin:16px 0 8px;font-size:15px;">操作步骤</h4>
+            <ol style="padding-left:20px;margin:0;">
+                <li>打开终端：<br><b>macOS</b> — 在 Launchpad 搜索「终端」<br><b>Windows</b> — 按 <code>Win+R</code>，输入 <code>powershell</code>，回车</li>
+                <li style="margin-top:8px;">输入 <code>hermes</code> 并回车，启动 Hermes</li>
+                <li style="margin-top:8px;">在 Hermes 对话框中输入以下内容并回车：</li>
+            </ol>
+            <div style="background:var(--bg-input);padding:12px;border-radius:6px;margin:10px 0;font-size:13px;word-break:break-all;">
+                帮我更新trade，并重启trade，地址是https://github.com/chefroger/smart%2Dtrade%2Dai
+            </div>
+            <p style="margin-top:8px;">等待执行完毕，看到「重启完成」提示后，刷新浏览器页面（<kbd style="background:var(--bg-muted);padding:1px 4px;">Ctrl+Shift+R</kbd>）即可。</p>
+            <p style="color:var(--text-muted);font-size:12px;margin-top:12px;">如果 <code>hermes</code> 命令找不到，说明 Hermes Agent 未安装。请先参考 <a href="https://github.com/chefroger/smart%2Dtrade%2Dai#readme" target="_blank" style="color:var(--primary);">安装说明</a> 安装 Hermes。</p>
+        </div>
+        <div class="form-actions"><button class="btn" onclick="hideModal('upgrade-help-modal')">关闭</button></div>
+    </div>
+</div>
+
+<!-- Skills Help Modal -->
+<div class="modal-backdrop hidden" id="skills-help-modal">
+    <div class="modal wide" style="max-width:800px;">
+        <h3>📖 全部 45 个技能速查</h3>
+        <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">在聊天框输入关键词，路路通ai助手 自动匹配合适的技能。点击复制图标可复制快速启动提示词。</p>
+        <div id="skills-help-content" style="max-height:58vh;overflow-y:auto;line-height:1.6;"></div>
+        <div class="form-actions"><button class="btn" onclick="hideModal('skills-help-modal')">关闭</button></div>
+    </div>
+</div>
+
+<!-- Hermes 版本过旧：全屏升级面板。默认隐藏，由 trade_chat.js 按 /system/hermes-compat 显示。
+     存在的理由：路路通ai助手 进程内嵌 Hermes，Hermes 版本过旧时 agent 功能全废；而桌面端
+     （tradewin）用户看不到终端，必须有个界面能告诉他们发生了什么、正在做什么。 -->
+<div class="hermes-upgrade-overlay hidden" id="hermes-upgrade-overlay">
+    <div class="hermes-upgrade-card">
+        <div class="hermes-upgrade-icon" id="hermes-upgrade-icon">⬆️</div>
+        <h2 id="hermes-upgrade-title">正在升级 Hermes</h2>
+        <p class="hermes-upgrade-message" id="hermes-upgrade-message"></p>
+        <div class="hermes-upgrade-steps" id="hermes-upgrade-steps"></div>
+        <div class="hermes-upgrade-actions" id="hermes-upgrade-actions"></div>
+        <details class="hermes-upgrade-details">
+            <summary>升级详情</summary>
+            <pre class="hermes-upgrade-log" id="hermes-upgrade-log"></pre>
+        </details>
+    </div>
+</div>
+
+<div id="toast-container"></div>
+
+<script>let TOKEN = "__TRADE_SESSION_TOKEN__";</script>
+<script src="/static/trade_chat.js"></script>
+</html>

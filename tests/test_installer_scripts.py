@@ -1,0 +1,1033 @@
+"""安装脚本的健壮性测试（install.sh / install.ps1）。
+
+这些缺陷都是实测发现的：
+- Step 4 用 `python -m trade.post_install install`，而该包**没有 __main__.py**
+  → 这一步永远失败（stderr 被 2>/dev/null 吞掉），新装后 skills 数为 0。
+- 克隆被中断会留下**空目录**，脚本用 `[ -d ]` 判定「已安装」→ 之后 git pull
+  静默失败、pip 在残缺树里报出误导性错误，且**重试永远不好**。
+- 全历史克隆是弱网下最慢的路径，且克隆/pip 的报错被 `2>/dev/null`、`| tail -1` 吞掉。
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+import subprocess
+import sys
+
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+SH = (ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+# 真正的安装逻辑（BOM：PS 5.1 用 -File 读时要按 UTF-8 解码中文）
+PS1 = (ROOT / "scripts" / "install-core.ps1").read_text(encoding="utf-8-sig")
+# 入口引导器：纯 ASCII、无 BOM，供 `irm ... | iex` 使用
+PS1_LAUNCHER = (ROOT / "scripts" / "install.ps1").read_bytes()
+# Hermes 前置软件脚本（不在 Trade 一键安装主链上，但单独运行也要正确）
+PREREQS = (ROOT / "scripts" / "install_prereqs.ps1").read_text(encoding="utf-8-sig")
+
+
+
+def _last_exit_code_reads(text: str = PS1) -> int:
+    """统计 install.ps1 里真正读取 `$LASTEXITCODE` 的代码行数（不含注释）。
+
+    写死数字会在脚本演进后悄悄过期 —— 这个 helper 让提示语与实际代码保持一致。
+    """
+    return sum(
+        1
+        for line in text.splitlines()
+        if "$LASTEXITCODE" in line and not line.strip().startswith("#")
+    )
+
+
+def _code_lines(text: str) -> str:
+    """去掉注释行后的脚本内容。
+
+    注释里会引用旧的错误写法（说明历史缺陷），断言只应针对真正的代码行。
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.strip().startswith("#")
+    )
+
+
+class TestSkillsInstallStep:
+    """Step 4 必须调用真实存在的入口。"""
+
+    def test_no_nonexistent_module_entry(self):
+        """不得再用 `-m trade.post_install install`（该包没有 __main__.py）。"""
+        for name, text in (("install.sh", SH), ("install.ps1", PS1)):
+            assert "-m trade.post_install install" not in _code_lines(text), \
+                f"{name} 仍在调用不存在的模块入口"
+
+    def test_uses_working_entry(self):
+        """必须出现可用的入口：console script 或 install_skills 调用。"""
+        for name, text in (("install.sh", SH), ("install.ps1", PS1)):
+            assert ("install-trade-skills" in text) or ("install_skills" in text), \
+                f"{name} 找不到可用的 skills 安装入口"
+
+
+class TestSkillsEntryActuallyWorks:
+    """「脚本里用的入口」必须真的能把 skills 装进去（行为验证）。"""
+
+    def test_install_skills_writes_into_hermes_home(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+
+        from trade.post_install import install_skills
+
+        install_skills()
+
+        installed = list((tmp_path / "hermes" / "skills").glob("*/SKILL.md"))
+        assert len(installed) > 0, "install_skills() 应当把 skills 复制进 HERMES_HOME/skills"
+
+
+class TestCloneRobustness:
+    """克隆要能自愈、要浅、要不吞错。"""
+
+    def test_shallow_clone(self):
+        for name, text in (("install.sh", SH), ("install.ps1", PS1)):
+            assert "--depth" in text, f"{name} 未使用浅克隆（弱网下全历史克隆最慢且最易失败）"
+
+    def test_detects_invalid_leftover_checkout(self):
+        """必须能识别「目录存在但不是有效 git 仓库」的残缺状态。"""
+        for name, text in (("install.sh", SH), ("install.ps1", PS1)):
+            assert "rev-parse --verify HEAD" in text, \
+                f"{name} 未校验仓库有效性（残缺目录会被误判为已安装，导致重试永远失败）"
+
+    def test_clone_errors_are_visible(self):
+        """克隆命令不得把 stderr 丢掉。"""
+        for name, text in (("install.sh", SH), ("install.ps1", PS1)):
+            for line in _code_lines(text).splitlines():
+                if "git clone" in line:
+                    assert "2>/dev/null" not in line, f"{name} 克隆丢了 stderr: {line.strip()}"
+                    assert "2>$null" not in line, f"{name} 克隆丢了 stderr: {line.strip()}"
+
+    def test_pip_errors_are_visible(self):
+        """pip 安装不得只留最后一行（会掩盖真实报错）。"""
+        for name, text in (("install.sh", SH), ("install.ps1", PS1)):
+            assert "install -e \".\" --quiet 2>&1 | tail -1" not in _code_lines(text), \
+                f"{name} 仍在截断 pip 报错"
+
+
+class TestHermesInstallPolicy:
+    """安装脚本必须让机器上只存在**一份** Hermes，且 Trade 用 Python 3.14 与它共存。
+
+    为什么（都由实测/事故推出来的）：
+      - 上游从 v0.21.6 起只提供 Python 3.14 的依赖集（requires-python 里的 `>=3.11`
+        只是留给旧安装跑完升级步骤的过渡桥）。Trade 是**进程内**嵌 Hermes 的，
+        解释器必须与 Hermes 的托管环境同 ABI，所以脚本必须只接受 3.14。
+      - **旧的固定 tag 方案（v2026.9.24）已废除**：它把 Hermes 装进 Trade 的 venv，
+        并与用户自己那份共用 `~/.hermes/hermes-agent`。结果是固定静默失效（目录里
+        已有检出就原样保留）、还把用户的 Hermes 降级 —— 见 COMPATIBILITY.md。
+        新方案不碰用户的 Hermes；版本过旧由 Trade 启动后在界面里自动升级。
+    """
+
+    @staticmethod
+    def _step_section(text: str, marker: str, *, until: str) -> str:
+        """取出脚本里 marker 到 until 之间的正文（用于断言「某一步没做什么」）。"""
+        start = text.index(marker)
+        end = text.index(until, start)
+        return text[start:end]
+
+    def test_scripts_require_python_314(self):
+        """Step 1 必须只接受 3.14：3.11~3.13 上 Trade 与 Hermes 的托管环境 ABI 不符。"""
+        for name, text in (("install.sh", SH), ("install.ps1", PS1)):
+            assert "3.14" in text, f"{name} 未提到 Python 3.14"
+        # 判据是「解释器正好是 3.14」，不是原来的「>= 3.11」下限写法
+        assert "sys.version_info[:2] == (3, 14)" in SH
+        assert "$PSVersionTable" in PS1 or "3, 14" in PS1 or "(3,14)" in PS1
+
+    def test_hermes_step_does_not_install_hermes_into_trade_venv(self):
+        """Step 2 绝不能再把 Hermes 克隆/安装进 Trade 的 venv。
+
+        那是旧方案的根因：它与用户自己那份抢同一个 checkout 目录，导致 pin 失效
+        并把用户的 Hermes 降级。新方案只确认 `hermes` 命令存在。
+
+        注意断言要针对**旧方案的具体特征**（克隆 Hermes 到数据目录、pip 装它、
+        固定 ref），不能简单地禁掉 "hermes-agent" —— 安装指引里的仓库 URL
+        （`NousResearch/hermes-agent/...`）本来就含这个词。
+        """
+        baselines = (
+            ("install.sh", SH, ("$HERMES_HOME/hermes-agent", '$PIP" install -e "."',
+                                'TRADE_HERMES_REF', '_clone_or_update "hermes-agent"')),
+            ("install.ps1", PS1, ("$HermesHome\\hermes-agent", 'install -e "."',
+                                  'TRADE_HERMES_REF', 'Invoke-CloneOrUpdate "hermes-agent"')),
+        )
+        for name, text, forbidden in baselines:
+            section = self._step_section(text, "Step 2/5", until="Step 3/5")
+            for needle in forbidden:
+                assert needle not in section, (
+                    f"{name} 的 Step 2 仍残留旧方案特征：{needle!r}"
+                )
+
+    def test_hermes_step_gives_install_guidance_when_missing(self):
+        """找不到 hermes 时必须给一条可直接复制的安装命令（用户群是电脑小白）。"""
+        for name, text in (("install.sh", SH), ("install.ps1", PS1)):
+            assert "NousResearch/hermes-agent/main/scripts" in text, (
+                f"{name} 未给出 Hermes 安装指引"
+            )
+
+    def test_installer_does_not_abort_on_old_hermes(self):
+        """安装脚本不得因「Hermes 版本过旧」判定安装失败。
+
+        否则用户永远见不到 Trade 界面里那个自动升级面板 —— 而升级正是在那里做的。
+        """
+        assert "ignore_names=('Hermes 版本',)" in SH, (
+            "install.sh 的自检未忽略「Hermes 版本」致命项"
+        )
+
+    def test_readmes_do_not_pin_a_hermes_checkout(self):
+        """README 不得再教用户把固定 tag 克隆到 ~/.hermes/hermes-agent。
+
+        那会覆盖用户已装的那份 Hermes —— 也正是旧方案的坑。
+        """
+        for name in ("README.md", "README.en.md"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            assert "git clone --branch v" not in text or "hermes-agent.git ~/.hermes" not in text, (
+                f"{name} 仍在用固定 tag 克隆 Hermes 到 ~/.hermes/hermes-agent"
+            )
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="需要真正的 POSIX bash：Windows runner 上的 bash 只是 WSL 存根（无发行版）。"
+           "install.sh 的 shell 辅助函数只服务 macOS/Linux，Windows 侧由 install.ps1 承担"
+           "（其行为已由本文件的静态断言覆盖）",
+)
+class TestCloneHelperBehaviour:
+    """行为验证（不只是静态断言）：残缺目录必须能被重克隆。"""
+
+    @staticmethod
+    def _extract_helper() -> str:
+        """从 install.sh 抽出 _clone_or_update 函数体（按花括号配对）。"""
+        start = SH.index("_clone_or_update() {")
+        depth = 0
+        for i in range(start, len(SH)):
+            if SH[i] == "{":
+                depth += 1
+            elif SH[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return SH[start:i + 1]
+        raise AssertionError("install.sh 里未找到 _clone_or_update 的结尾")
+
+    @staticmethod
+    def _make_local_repo(path: pathlib.Path) -> pathlib.Path:
+        """造一个本地 git 仓库当克隆源（不需要网络）。"""
+        import subprocess
+
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "pyproject.toml").write_text('version = "1.0.0"\n', encoding="utf-8")
+        git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
+        subprocess.run([*git, "add", "-A"], cwd=path, check=True)
+        subprocess.run([*git, "commit", "-qm", "init"], cwd=path, check=True)
+        return path
+
+    def _run_helper(self, repo: str, dest: pathlib.Path, ref: str | None = None) -> tuple[str, int]:
+        import subprocess
+
+        extra = f' "{ref}"' if ref else ""
+        script = (
+            "log_info(){ :; }; log_ok(){ :; }; log_warn(){ :; }; log_err(){ :; }\n"
+            + self._extract_helper()
+            + f'\n_clone_or_update "test" "{repo}" "{dest}"{extra} && echo RESULT_OK || echo RESULT_FAIL\n'
+        )
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        return proc.stdout + proc.stderr, proc.returncode
+
+    def test_recovers_from_broken_leftover_directory(self, tmp_path):
+        """目录存在但不是 git 仓库（克隆中断的残留）→ 必须重新克隆。
+
+        旧逻辑用 `[ -d ]` 判定「已安装」，于是只跑 git pull（静默失败）+
+        在残缺树里 pip install，重试永远无法恢复。
+        """
+        src = self._make_local_repo(tmp_path / "src")
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        (dest / "leftover.txt").write_text("残留", encoding="utf-8")  # 非仓库内容
+
+        out, _ = self._run_helper(str(src), dest)
+
+        assert "RESULT_OK" in out, out
+        assert (dest / ".git").is_dir(), f"残留目录未被重新克隆：{out}"
+        assert (dest / "pyproject.toml").is_file(), "克隆后应含源仓库内容"
+
+    def test_reuses_valid_checkout(self, tmp_path):
+        """已是有效仓库时走更新分支，不重新克隆。"""
+        src = self._make_local_repo(tmp_path / "src2")
+        dest = tmp_path / "dest2"
+
+        out, _ = self._run_helper(str(src), dest)   # 首次：克隆
+        assert "RESULT_OK" in out, out
+        marker = dest / "local-marker.txt"
+        marker.write_text("本地标记", encoding="utf-8")
+
+        out2, _ = self._run_helper(str(src), dest)  # 再次：应为 pull 分支
+        assert "RESULT_OK" in out2, out2
+        assert marker.is_file(), "走了重新克隆（本地文件被删）—— 应走更新分支"
+
+    def test_reports_failure_when_repo_unavailable(self, tmp_path):
+        """克隆源不可用时必须返回失败，让调用方中止（而不是继续用残缺树）。"""
+        out, rc = self._run_helper(str(tmp_path / "no-such-repo"), tmp_path / "dest3")
+
+        assert "RESULT_FAIL" in out, out
+        assert rc == 0  # 脚本自身正常结束，失败通过返回值表达
+
+    def test_pinned_ref_clones_that_tag_and_never_moves_to_main(self, tmp_path):
+        """固定版本模式：克隆指定 tag，且**再次运行时不得被拖到 main 尖端**。
+
+        背景：main 每天前进约 200 个提交，一旦越出 Trade 的兼容窗口
+        （0.13.0 ≤ v < 0.22.0），新装机器会「装得上、起不来」。所以安装脚本把
+        Hermes 固定在已核对兼容的 release tag 上 —— 而固定只有在**不会**被
+        后续 pull main 悄悄带走时才有意义（在 tag 检出上 `git pull origin main`
+        会直接快进到 main 尖端）。
+        """
+        import subprocess
+
+        src = self._make_local_repo(tmp_path / "src_pin")
+        git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run(["git", "tag", "v0.21.7"], cwd=src, check=True)
+        tag_sha = subprocess.run(
+            ["git", "rev-parse", "v0.21.7"], cwd=src, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+        dest = tmp_path / "dest_pin"
+        out, _ = self._run_helper(str(src), dest, ref="v0.21.7")
+        assert "RESULT_OK" in out, out
+        head1 = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=dest, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        assert head1 == tag_sha, f"克隆未落在固定 tag 上：{out}"
+
+        # 源仓库 main 前进（模拟上游发新版），再次运行安装脚本
+        (src / "new.txt").write_text("新提交", encoding="utf-8")
+        subprocess.run([*git, "add", "-A"], cwd=src, check=True)
+        subprocess.run([*git, "commit", "-qm", "advance main"], cwd=src, check=True)
+
+        out2, _ = self._run_helper(str(src), dest, ref="v0.21.7")
+        assert "RESULT_OK" in out2, out2
+        head2 = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=dest, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        assert head2 == tag_sha, f"固定 tag 被拖到了 main 尖端（固定失效）：{out2}"
+
+
+class TestLauncherDisablesHermesLazyInstalls:
+    """生成的启动器必须禁用 Hermes 懒加载重启。
+
+    客户机实测（2026-10-08）：「网站诊断」时前端只显示「Agent 未返回有效回复」。
+    成因是 `from run_agent import AIAgent` 连带执行 Hermes 的 `hermes_bootstrap.py`，
+    它把 server.py 重新 exec 到 Hermes 自带的 store python（那里没有 trade 包），
+    子进程 ModuleNotFoundError 退出，父进程 raise RelaunchExit(1)——继承 SystemExit，
+    Trade 的 except Exception 抓不到，agent 线程静默死亡。
+
+    `trade/bootstrap.py` 已在代码层设了这个开关；启动器里再设一次是双保险，而且
+    **必须写进生成器**：`trade.cmd` 是 install.ps1 生成的产物，手改会被重装抹掉。
+    """
+
+    FLAG = "HERMES_DISABLE_LAZY_INSTALLS"
+
+    def test_bash_launcher_sets_flag(self):
+        assert self.FLAG in _code_lines(SH), (
+            "install.sh 生成的 ~/.local/bin/trade 未禁用 Hermes 懒加载重启"
+        )
+
+    def test_powershell_launcher_sets_flag(self):
+        assert self.FLAG in _code_lines(PS1), (
+            "install.ps1 生成的 trade.cmd 未禁用 Hermes 懒加载重启"
+        )
+
+    def test_flag_value_is_one(self):
+        """两个脚本都必须设成 1（上游判的是 == "1"，别的值等于没设）。"""
+        import re
+
+        for name, text in (("install.sh", SH), ("install.ps1", PS1)):
+            body = _code_lines(text)
+            # bash: export FLAG="1"  /  cmd: set FLAG=1
+            assert re.search(rf'{self.FLAG}=(?:"1"|1)(\s|$)', body), (
+                f"{name} 里 {self.FLAG} 的值不是 1"
+            )
+
+
+class TestPowerShellChecksPipExitCodes:
+    """install.ps1 的每个 pip 调用后都必须检查 $LASTEXITCODE。
+
+    历史 bug：Step 2（装 Hermes）显式查了退出码，Step 3（装 Trade 依赖）没查 ——
+    而脚本自己在 105 行注释过「PowerShell 里原生命令非零退出不会抛异常」，
+    同一个坑只堵了一半。后果：弱网下 requirements.txt 装失败，脚本照样打印
+    「✓ 路路通ai助手 安装完成」→「══ 安装完成 ══」，用户运行 trade
+    只得到一句 ModuleNotFoundError，且开机自启任务每次登录都静默失败。
+
+    macOS 走 install.sh（`set -e`，pip 失败即中止）所以开发机看不出来；
+    CI 的 windows-latest 不跑安装脚本。
+    """
+
+    def test_each_pip_install_is_followed_by_exit_code_check(self):
+        body = _code_lines(PS1)
+        lines = body.splitlines()
+        checked = 0
+
+        for idx, line in enumerate(lines):
+            if "& $PipCmd install" not in line:
+                continue
+            # 其后 3 行内必须出现 $LASTEXITCODE 判定
+            window = "\n".join(lines[idx + 1: idx + 4])
+            assert "$LASTEXITCODE" in window, (
+                f"第 {idx + 1} 行的 `{line.strip()}` 之后没有检查 $LASTEXITCODE —— "
+                "pip 失败会被当成安装成功"
+            )
+            checked += 1
+
+        # 脚本里共 2 处 pip 调用：requirements + Trade 自身（sqlite-vec 已改为可选）
+        assert checked >= 2, f"应覆盖全部 2 处 pip 调用，实际 {checked}"
+
+    def test_failure_exits_nonzero(self):
+        """失败分支必须真的中止脚本，而不是只打印一行。"""
+        body = _code_lines(PS1)
+
+        assert "exit 1" in body, "安装失败没有 exit 1"
+
+
+class TestPowerShellLauncherEncoding:
+    """trade.cmd 用 ASCII 落盘会把中文用户名路径写成 '?'。
+
+    `-Encoding ASCII` 把每个非 ASCII 字符替换为 `?` 且**不报错**。中文 Windows
+    用户名（C:\\Users\\张伟\\...）是本产品的主力用户群，写坏后 `trade` 命令报
+    「系统找不到指定的路径」，而自启任务用的是 API 传参（不受影响）——
+    于是表现为「后台能跑、命令坏了」，更难排查。
+    """
+
+    def test_launcher_not_written_as_ascii(self):
+        body = _code_lines(PS1)
+
+        assert "-Encoding ASCII" not in body, (
+            "trade.cmd 仍用 ASCII 编码 —— 中文用户名路径会被写成 '?'"
+        )
+
+    def test_launcher_uses_unicode_capable_encoding(self):
+        import re
+
+        body = _code_lines(PS1)
+
+        assert re.search(r"-Encoding\s+(OEM|Default|UTF8|utf8)", body), (
+            "应改用能承载非 ASCII 的编码（OEM/Default/UTF8）"
+        )
+
+    def test_selfcheck_prepares_hermes_import_paths_first(self):
+        """安装收尾的自检必须先准备 Hermes 的 import 路径。
+
+        2026-10-15 干净机器实测（Bug 1）：自检用 `python -c` 直接调 doctor，绕过了
+        bootstrap 的路径准备 —— 而 Hermes 不再装进 Trade 的 venv，于是报
+        `No module named 'run_agent'`，**安装永远过不了自检**。同一步还负责恢复 pm
+        激活剥离掉的 site-packages，漏了会让 doctor 后面几项误报「未安装」。
+        """
+        for name, text in (("install.sh", SH), ("install.ps1", PS1)):
+            line = next(
+                (ln for ln in text.splitlines() if "run_doctor" in ln and "trade.doctor" in ln),
+                None,
+            )
+            assert line, f"{name} 未见调用 trade.doctor 的自检行"
+            assert "prepare_hermes_import_paths()" in line, (
+                f"{name} 的自检没有先准备 Hermes 的 import 路径"
+            )
+            # 顺序必须真的对：先准备路径，再 import doctor
+            assert line.index("prepare_hermes_import_paths()") < line.index("trade.doctor"), (
+                f"{name} 的自检把 import doctor 排在了路径准备之前"
+            )
+
+    def test_python314_discovery_is_layout_agnostic(self):
+        """3.14 的发现必须对布局免疫，不能写死成单一 glob。
+
+        2026-10-15 用户实测：我按代码推断出来的单一 glob
+        （`installs/*/environments/*/bin/python`）在真机上一个都匹配不到 —— 真实布局是
+        **两棵代际树**（`environments/` 与 `pm-runtime/generations/`），且代际里还套一层
+        `venv/`（权威来源 `pm/operations.py:152/210` 的 `generation / "venv"`、
+        `pm/install_states.py:72` 的两棵树）。写死布局一旦猜错就是「静默找不到」，
+        而开发者无法在自己机器上观测真实布局 —— 所以必须是**递归找 + 按版本号验**。
+        """
+        # install.sh：递归 + 深度上限（避免钻进 site-packages）
+        assert "find " in SH and "-maxdepth" in SH, "install.sh 的 3.14 发现仍是写死布局"
+        assert "_is_py314" in SH, "install.sh 未按版本号验证（只信文件名会选到 3.13）"
+        # install.ps1：同上
+        assert "-Recurse" in PS1 and "-Depth" in PS1, "install.ps1 的 3.14 发现仍是写死布局"
+        assert "IsPython314" in PS1, "install.ps1 未按版本号验证"
+
+    def test_venv_rebuild_dumps_pip_freeze_before_removing(self):
+        """重建 venv 之前必须把已装包清单留档。
+
+        删除是不可逆的，而 venv 里可能有用户手动 `pip install` 的东西（对电脑小白是
+        零风险，但对装过额外包的人是唯一的事后线索）。成本一行，值得。
+        """
+        cases = (
+            ("install.sh", SH, 'rm -rf "$VENV_DIR"'),
+            ("install.ps1", PS1, "Remove-Item -Recurse -Force $VenvDir"),
+        )
+        for name, text, rm_marker in cases:
+            assert rm_marker in text, f"{name} 未见删除 venv 的动作"
+            before_rm = text[: text.index(rm_marker)]
+            assert "venv-packages-before-rebuild.txt" in before_rm, (
+                f"{name} 在删除 venv 之前没有留包清单"
+            )
+
+
+class TestVenvRebuildIsAtomic:
+    """重建运行环境必须**原子**：新环境先建到 .new，依赖全部装成功后才切换。
+
+    2026-10-16 改。原实现是 `rm -rf "$VENV_DIR"` 之后**原地**重建，于是中间任何一步
+    失败（断网 / 磁盘满 / 找不到 3.14 / 依赖装不上）都会留下「旧的已经删了、新的没
+    建成」—— 用户的软件直接打不开。
+
+    命中这条路径的正是**旧装机器**：2026-10-14 之前装的机器 venv 跑的是
+    Python 3.11~3.13，而 Hermes ≥0.21.6 只发 3.14 的依赖集，所以它们一升级 trade
+    就必须重建 venv。而客群是电脑小白，读不懂也修不了 `ModuleNotFoundError`。
+
+    改成原子切换后，失败时旧环境原样可用 —— 这是「升级不会把能用的软件搞坏」
+    这条承诺的兑现处。
+    """
+
+    def test_sh_builds_into_a_staging_dir(self):
+        body = _code_lines(SH)
+        assert "_VENV_REAL" in body, "install.sh 没有区分「真实 venv」与「暂存目录」"
+        assert "${_VENV_REAL}.new" in body, "install.sh 未把新环境建到 .new 暂存目录"
+
+    def test_sh_swap_happens_after_dependency_install(self):
+        """切换必须排在 pip install **之后**。
+
+        这是本设计的核心：把唯一不可逆的动作压到所有可能失败的动作之后。
+        若有人把切换挪回「建完 venv 就换」，失败面立刻回到改动前的样子。
+        """
+        body = _code_lines(SH)
+        pip_at = body.index('"$PIP" install -r requirements.txt')
+        swap_at = body.index('if [ -n "$_VENV_OLD" ]', pip_at)
+        assert swap_at > pip_at, "install.sh 在装依赖之前就切换运行环境了"
+
+    def test_sh_rolls_back_code_when_pip_fails(self):
+        """依赖装不上时必须回退代码。
+
+        否则「新代码 + 旧 venv」照样起不来 —— 把「重建失败」升级成「彻底打不开」。
+        """
+        body = _code_lines(SH)
+        assert "_rollback_code()" in body, "install.sh 未定义代码回滚函数"
+        assert "_TRADE_HEAD_BEFORE" in body, "install.sh 未记录回滚点"
+        # 两处 pip 失败分支都要调用回滚（requirements.txt 与 trade 自身）
+        assert body.count("_rollback_code") >= 3, (
+            "install.sh 的 pip 失败分支没有调用回滚（应至少：定义 1 次 + 两处失败分支各 1 次）"
+        )
+
+    def test_ps1_mirrors_the_same_design(self):
+        """Windows 版必须与 sh 版同构 —— 跨平台一致性是项目硬规则。"""
+        body = _code_lines(PS1)
+        assert "$VenvReal" in body, "install.ps1 没有区分「真实 venv」与「暂存目录」"
+        assert "$VenvReal.new" in body, "install.ps1 未把新环境建到 .new 暂存目录"
+        assert "$VenvOld" in body, "install.ps1 未保留旧环境引用"
+        assert "Invoke-RollbackCode" in body, "install.ps1 未实现代码回滚"
+
+    def test_ps1_swap_happens_after_import_probe(self):
+        """ps1 的切换点还要更靠后 —— 排在 `import trade.app` 探针之后。
+
+        sh 版没有这个探针，ps1 版有（第 240 行附近），所以它的失败面可以更小：
+        新环境连 `import trade.app` 都过不了就绝不切换。
+        """
+        body = _code_lines(PS1)
+        probe_at = body.index('import trade.app')
+        swap_at = body.index("if ($VenvOld)", probe_at)
+        assert swap_at > probe_at, "install.ps1 在 import 探针之前就切换运行环境了"
+
+
+class TestWindowsInstallerGaps:
+    """Windows 一键安装脚本必须自己补齐的 Windows 特有缺口。
+
+    这些都不是「macOS 版有、Windows 版没有」的排版差异，而是**只有 Windows 才会
+    踩到**的问题：Store 别名会弹商店、py 启动器才是精确选版本的入口、git 缺失时
+    小白看不懂英文报错、cmd.exe 按 OEM 代码页读 .bat 会把中文用户名写成 '?'。
+    """
+
+    def test_git_missing_gives_actionable_guidance(self):
+        """git 是克隆代码的硬前提，缺了必须给安装命令而不是让用户看英文报错。"""
+        assert "winget install Git.Git" in PS1, "install.ps1 未给出 git 的安装命令"
+        body = _code_lines(PS1)
+        git_at = body.index("Get-Command git")
+        clone_at = body.index('Invoke-CloneOrUpdate "foreign-trade-assistant"')
+        assert git_at < clone_at, "git 检查必须排在克隆之前"
+
+    def test_py_launcher_can_select_exact_version(self):
+        """`py -3.14` 是 Windows 独有的精确选版本入口（PATH 上的 python 常是 3.11）。"""
+        assert "Get-Command py" in PS1, "install.ps1 未尝试 Windows 的 py 启动器"
+        assert "-3.14" in PS1, "install.ps1 未用 py 启动器指定 3.14"
+
+    def test_py_launcher_args_are_splatted_not_joined(self):
+        """`py -3.14` 的命令与参数必须分开存，否则 `& $PythonCmd` 会把数组拼成命令名。
+
+        2026-11-03 客户机实测：$PythonCmd = @("...py.exe", "-3.14") 再 `& $PythonCmd`
+        → 「无法将 "...py.exe -3.14" 项识别为 cmdlet」，建 venv 一步直接中断。
+        """
+        body = _code_lines(PS1)
+        assert "& $PythonCmd @PyArgs -m venv" in body, (
+            "建 venv 时没有展开 $PyArgs —— py 启动器路径会再次把参数拼进命令名"
+        )
+        assert '$PyArgs = @("-3.14")' in body, "py 启动器的参数没有单独保存"
+        assert "$PythonCmd = @(" not in body, (
+            "不能把命令与参数塞进同一个变量：`& $array` 会拼成一个字符串当命令名"
+        )
+
+    def test_store_alias_is_skipped(self):
+        """Microsoft Store 的应用执行别名会把安装器卡在「弹商店」。"""
+        assert "WindowsApps" in PS1, "install.ps1 未排除 Store 别名（会弹商店卡住安装）"
+
+    def test_venv_creation_failure_is_detected(self):
+        """建 venv 失败必须当场退出 —— 原生命令非零退出不抛异常。"""
+        body = _code_lines(PS1)
+        venv_at = body.index("-m venv")
+        window = body[venv_at: venv_at + 400]
+        assert "$LASTEXITCODE" in window, "install.ps1 未检查建 venv 的退出码"
+
+    def test_db_init_failure_is_not_reported_as_success(self):
+        """init_db 失败不能打印「✓ 完成」—— 原生命令非零退出不会进 catch。"""
+        body = _code_lines(PS1)
+        idx = body.index("init_db; init_db()")
+        window = body[idx: idx + 900]
+        assert "$LASTEXITCODE" in window, "数据库初始化没有检查退出码（会假成功）"
+        assert "数据库初始化未完成" in PS1, "失败分支缺少如实文案"
+
+    def test_non_ascii_launcher_uses_ps1_fallback(self):
+        """自定义非 ASCII 路径不能只警告 —— 改用 UTF-8 启动器，保证 trade 能跑。"""
+        body = _code_lines(PS1)
+        assert "Test-AsciiBatchPath" in body, "缺少非 ASCII 路径检测"
+        assert "trade-launcher.ps1" in body, "没有生成 PowerShell 启动器兜底"
+        assert "UTF8Encoding($true)" in body, "启动器不是带 BOM 的 UTF-8"
+        assert "%~dp0trade-launcher.ps1" in body, ".cmd 没有调用兜底启动器"
+        # 常规路径（含中文用户名）仍走纯 ASCII 的 .cmd 快速路径
+        assert "set HERMES_HOME=$BatchHermesHome" in body
+
+    def test_child_python_forced_to_utf8(self):
+        """中文用户名下，Python 输出被捕获回来不能是 ??????。"""
+        body = _code_lines(PS1)
+        assert '$env:PYTHONUTF8 = "1"' in body
+        assert '$env:PYTHONIOENCODING = "utf-8"' in body
+
+    def test_git_uses_system_proxy_when_env_unset(self):
+        """git/pip 不读 Windows 系统代理 —— 必须转成进程级 HTTP(S)_PROXY。
+
+        2026-11-04 客户机：irm 能下载（WinINET 代理），git clone 直连超时 21s。
+        """
+        body = _code_lines(PS1)
+        assert "Internet Settings" in body and "ProxyServer" in body, "没有读取系统代理"
+        assert "$env:HTTPS_PROXY = $proxyUrl" in body
+        assert "$env:HTTP_PROXY  = $proxyUrl" in body
+        assert "-not $env:HTTPS_PROXY" in body, "不能覆盖用户已显式设置的代理"
+
+    def test_clone_failure_mentions_proxy_hint(self):
+        assert "git 没走代理" in PS1, "克隆失败时没有给出代理排查提示"
+
+    def test_launcher_exports_trade_home(self):
+        """启动器必须带出 TRADE_HOME —— 否则自定义数据目录时服务读的是另一个目录。"""
+        body = _code_lines(PS1)
+        assert "set TRADE_HOME=" in body, "install.ps1 生成的 trade.cmd 未导出 TRADE_HOME"
+
+    def test_launcher_paths_are_ascii_safe(self):
+        """写进 .cmd 的路径必须用环境变量展开，避免中文用户名被 OEM 编码写成 '?'。"""
+        body = _code_lines(PS1)
+        assert "ConvertTo-BatchPath" in body, (
+            "install.ps1 未把用户目录前缀换成环境变量引用（中文用户名会写成 '?'）"
+        )
+        assert "%$envName%" in body and "LOCALAPPDATA" in body and "USERPROFILE" in body, (
+            "install.ps1 未用 %LOCALAPPDATA% / %USERPROFILE% 展开用户目录前缀"
+        )
+
+    def test_hermes_discovery_does_not_rely_on_include_with_recurse(self):
+        """-Include 配 -Recurse 会**整体失效**（返回目录里所有文件），必须用 -Filter。"""
+        body = _code_lines(PS1)
+        assert "-Include" not in body, (
+            "install.ps1 用了 -Include —— 配 -Recurse 时过滤条件会被忽略"
+        )
+        assert '-Filter "hermes.*"' in body, "install.ps1 未用 -Filter 递归找 hermes"
+
+    def test_long_paths_is_warned_not_blocked(self):
+        """长路径未开启要提示（给命令），但**不得阻断安装**。"""
+        assert "LongPathsEnabled" in PS1, "install.ps1 未检测长路径支持"
+        body = _code_lines(PS1)
+        warn_at = body.index("LongPathsEnabled")
+        # 检测块之后不得紧跟 exit（提示不等于拦截）
+        assert "exit 1" not in body[warn_at: warn_at + 500], (
+            "长路径提示不得阻断安装（可用性高于一切）"
+        )
+
+
+class TestPowerShell51Compatibility:
+    """install.ps1 必须在 **Windows PowerShell 5.1**（客户机的唯一版本）上跑通。
+
+    2026-10-29 Lau 远程装机实测到两个 5.1 独占故障：
+      1. 文件是 UTF-8 **无 BOM** → 5.1 按系统代码页（936/GBK）解码 → 中文注释/字符串
+         处直接语法错误。PS 7 默认按 UTF-8 读，所以开发机看不出来。
+      2. `$ErrorActionPreference="Stop"` 下把**原生命令**的 stderr 重定向
+         （`2>$null` / `2>&1` / `*> $null`）→ 那条 stderr 变成 ErrorRecord 并终止脚本。
+         干净机器上第一次命中是 `import sqlite_vec`（没装 → traceback 进 stderr）。
+    """
+
+    def test_core_has_utf8_bom(self):
+        raw = (ROOT / "scripts" / "install-core.ps1").read_bytes()
+        assert raw.startswith(b"\xef\xbb\xbf"), (
+            "install-core.ps1 缺 UTF-8 BOM —— PS 5.1 用 -File 时会按 GBK 解析中文，出现语法错误"
+        )
+
+    def test_no_bare_native_stderr_redirect(self):
+        """每一处 stderr 重定向都必须包在 Invoke-NativeQuiet 里。"""
+        offenders = [
+            line.strip()
+            for line in _code_lines(PS1).splitlines()
+            if any(tok in line for tok in ("2>$null", "2>&1", "*> $null"))
+            and "Invoke-NativeQuiet" not in line
+        ]
+        assert not offenders, (
+            "以下行在 PS 5.1 下会因 stderr 重定向而终止脚本，需包进 Invoke-NativeQuiet：\n  "
+            + "\n  ".join(offenders)
+        )
+
+    def test_exit_code_is_actually_used_after_every_wrapped_command(self):
+        """包进 helper 的原生命令，后面必须有人读 `$LASTEXITCODE`。
+
+        反例：包了 helper 却不判退出码 —— stderr 不再中断脚本，但失败被静默吞掉，
+        用户看到「✓ 完成」而实际什么都没装（历史上 skills 那步正是这种假成功）。
+        计数比大小而不是写死数字，脚本演进后提示语也不会过期。
+        """
+        wrapped = sum(
+            1
+            for line in _code_lines(PS1).splitlines()
+            if "Invoke-NativeQuiet {" in line and not line.strip().startswith("function")
+        )
+        reads = _last_exit_code_reads()
+
+        assert reads >= wrapped, (
+            f"包进 Invoke-NativeQuiet 的命令有 {wrapped} 处，但只读到 {reads} 处 "
+            "`$LASTEXITCODE` —— 有命令的失败被静默吞掉了"
+        )
+
+    @staticmethod
+    def _helper_source() -> str:
+        """从 install.ps1 抽出 Invoke-NativeQuiet 函数体（按花括号配对）。"""
+        start = PS1.index("function Invoke-NativeQuiet")
+        depth = 0
+        for i in range(start, len(PS1)):
+            if PS1[i] == "{":
+                depth += 1
+            elif PS1[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return PS1[start: i + 1]
+        raise AssertionError("install.ps1 里未找到 Invoke-NativeQuiet 的结尾")
+
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="需要 Windows PowerShell 5.1 —— 只有 Windows runner 才有",
+    )
+    def test_ps51_parses_install_script(self, tmp_path):
+        """用真 PS 5.1 解析整份 install.ps1 —— BOM 要解决的正是「5.1 解析不了」。
+
+        别的测试读的是文本内容；这里让 5.1 自己的解析器读磁盘上的字节，
+        才能证明 BOM 真的让中文注释按 UTF-8 解码、而不是按 GBK 解出语法错误。
+        """
+        target = str((ROOT / "scripts" / "install-core.ps1").resolve()).replace("'", "''")
+        script = tmp_path / "parse.ps1"
+        script.write_text(
+            "$t = $null; $e = $null\n"
+            f"[void][System.Management.Automation.Language.Parser]::ParseFile('{target}', [ref]$t, [ref]$e)\n"
+            "if ($e -and $e.Count) {\n"
+            "    $e | ForEach-Object { Write-Output (\"line \" + $_.Extent.StartLineNumber + \": \" + $_.Message) }\n"
+            "    exit 1\n"
+            "}\n"
+            'Write-Output "PARSE_OK"\n',
+            encoding="utf-8",
+        )
+
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            capture_output=True, text=True, timeout=120,
+        )
+
+        assert proc.returncode == 0, (
+            "PS 5.1 解析 install.ps1 失败（BOM 没解决中文解码？）：\n"
+            f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        )
+        assert "PARSE_OK" in proc.stdout
+
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="需要 Windows PowerShell 5.1 —— 只有 Windows runner 才有",
+    )
+    def test_helper_propagates_last_exit_code_on_ps51(self, tmp_path):
+        """helper 返回后，调用方必须还能读到**这条命令**的退出码。
+
+        这是 Invoke-NativeQuiet 改法的要害：脚本里十几处都靠
+        `$LASTEXITCODE` 判断成败（Python 3.14 探测、git rev-parse 判断「是不是
+        有效仓库」等）。若退出码传不回调用方，`$LASTEXITCODE` 读到的是**上一条**
+        命令的旧值 —— 于是「Python 3.14 找不到」「把残缺目录当成有效仓库」，
+        安装在第一步就崩，而且报错完全指不到真正的原因。
+
+        PowerShell 的 `$LASTEXITCODE` 是否跨函数作用域传播，各版本行为不一致，
+        所以必须在真 5.1 上验，而不是靠推断。
+        """
+        script = tmp_path / "exitcode.ps1"
+        script.write_text(
+            self._helper_source() + "\n"
+            '$ErrorActionPreference = "Stop"\n'
+            # 先跑一条成功命令，把 $LASTEXITCODE 置成 0
+            'Invoke-NativeQuiet { & cmd.exe /c "exit 0" }\n'
+            "$afterSuccess = $LASTEXITCODE\n"
+            # 再跑一条失败命令
+            'Invoke-NativeQuiet { & cmd.exe /c "exit 7" }\n'
+            "$afterFail = $LASTEXITCODE\n"
+            'Write-Output ("SUCCESS=" + $afterSuccess + " FAIL=" + $afterFail)\n',
+            encoding="utf-8",
+        )
+
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            capture_output=True, text=True, timeout=120,
+        )
+
+        assert proc.returncode == 0, (
+            f"脚本本身失败：\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        )
+        assert "SUCCESS=0 FAIL=7" in proc.stdout, (
+            "helper 没有把退出码传回调用方 —— install.ps1 里 "
+            f"{_last_exit_code_reads()} 处 `$LASTEXITCODE` 判断会读到旧值。\n"
+            f"stdout={proc.stdout!r}"
+        )
+
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="需要 Windows PowerShell 5.1 —— 只有 Windows runner 才有",
+    )
+    def test_repro_native_stderr_redirect_aborts_ps51(self, tmp_path):
+        """复现根因：5.1 下 Stop + `2>$null` 会中止脚本（PS 7 不会）。"""
+        script = tmp_path / "repro.ps1"
+        script.write_text(
+            '$ErrorActionPreference = "Stop"\n'
+            "try {\n"
+            '    & python -c "import sys; sys.stderr.write(\'boom\')" 2>$null\n'
+            '    Write-Output "SURVIVED"\n'
+            "} catch {\n"
+            '    Write-Output ("ABORTED: " + $_.Exception.GetType().Name)\n'
+            "    exit 7\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            capture_output=True, text=True, timeout=120,
+        )
+
+        assert proc.returncode == 7, (
+            "本机 PowerShell 没有复现 NativeCommandError —— 说明根因判断需要重做。\n"
+            f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        )
+        assert "ABORTED" in proc.stdout
+
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="需要 Windows PowerShell 5.1 —— 只有 Windows runner 才有",
+    )
+    def test_helper_survives_on_ps51(self, tmp_path):
+        """用脚本里**实际那份** helper，同样的命令不能再炸。"""
+        script = tmp_path / "fixed.ps1"
+        script.write_text(
+            self._helper_source() + "\n"
+            '$ErrorActionPreference = "Stop"\n'
+            'Invoke-NativeQuiet { & python -c "import sys; sys.stderr.write(\'boom\')" 2>$null }\n'
+            'Write-Output "SURVIVED"\n',
+            encoding="utf-8",
+        )
+
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            capture_output=True, text=True, timeout=120,
+        )
+
+        assert proc.returncode == 0, (
+            f"helper 在 PS 5.1 下仍然失败：\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        )
+        assert "SURVIVED" in proc.stdout
+
+
+class TestPowerShellLauncher:
+    """install.ps1 是纯 ASCII 引导器 —— 同时喂 `irm | iex` 和 `-File` 两条路。
+
+    背景（2026-11-03 客户机）：core 带 BOM，才能被 PS 5.1 的 `-File` 正确解码中文；
+    但同一个 BOM 经过 `irm | iex` 会变成字符串首字符 U+FEFF，5.1 把 `﻿#Requires`
+    当成命令名，报「无法将"﻿#Requires"项识别为 ...」。引导器必须无 BOM、纯 ASCII，
+    再把 core 按 UTF-8 解码并剥掉 BOM。
+    """
+
+    def test_launcher_is_ascii_without_bom(self):
+        assert not PS1_LAUNCHER.startswith(b"\xef\xbb\xbf"), "引导器不能带 BOM"
+        assert all(b < 0x80 for b in PS1_LAUNCHER), (
+            "引导器必须是纯 ASCII，否则 PS 5.1 解码中文时又会出现语法错误"
+        )
+
+    def test_launcher_loads_and_deboms_core(self):
+        text = PS1_LAUNCHER.decode("ascii")
+        assert "install-core.ps1" in text, "引导器没指向 core"
+        assert "0xFEFF" in text, "引导器没有剥 BOM"
+        assert "Invoke-Expression" in text
+
+    def test_launcher_prefers_local_core(self):
+        """本地克隆时直接跑同目录 core，避免再走一次网络。"""
+        text = PS1_LAUNCHER.decode("ascii")
+        assert "$PSScriptRoot" in text and "Test-Path" in text
+
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="需要 Windows PowerShell 5.1 —— 只有 Windows runner 才有",
+    )
+    def test_launcher_runs_bom_core_on_ps51(self, tmp_path):
+        """引导器 + 带 BOM 的 core 放同目录，用 -File 真跑一遍。
+
+        证明 5.1 下「读 core → 剥 U+FEFF → iex」这条链成立；假 core 只打印一行，
+        不会真的安装任何东西。
+        """
+        (tmp_path / "install.ps1").write_bytes(PS1_LAUNCHER)
+        (tmp_path / "install-core.ps1").write_bytes(
+            b"\xef\xbb\xbf" + b'Write-Output "CORE_OK"\n'
+        )
+
+        proc = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", str(tmp_path / "install.ps1"),
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+
+        assert proc.returncode == 0, (
+            f"引导器没跑通：\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        )
+        assert "CORE_OK" in proc.stdout
+
+
+class TestPrereqScript:
+    """install_prereqs.ps1 不在 Trade 一键安装主链上，但单独执行也必须正确。"""
+
+    def test_has_bom_for_ps51(self):
+        raw = (ROOT / "scripts" / "install_prereqs.ps1").read_bytes()
+        assert raw.startswith(b"\xef\xbb\xbf"), (
+            "install_prereqs.ps1 缺 UTF-8 BOM —— PS 5.1 用 -File 读中文会解析失败"
+        )
+
+    def test_python_version_matches_runtime_policy(self):
+        body = _code_lines(PREREQS)
+        assert '$PythonVersion = "3.14"' in body
+        assert "3.11" not in body, "前置脚本仍指向 Python 3.11（Hermes 0.21.6+ 需要 3.14）"
+
+    def test_winget_uv_id_is_correct(self):
+        body = _code_lines(PREREQS)
+        assert "--id astral-sh.uv" in body, "winget 官方包 ID 是 astral-sh.uv"
+        assert "--id Astronaut.uv" not in body
+
+    def test_no_backslash_escaped_quotes(self):
+        """PowerShell 用反引号转义；反斜杠+引号会提前结束字符串。"""
+        assert '\\"' not in PREREQS
+
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="需要 Windows PowerShell 5.1 —— 只有 Windows runner 才有",
+    )
+    def test_ps51_parses_prereqs(self, tmp_path):
+        """用真 PS 5.1 解析整份前置脚本（验证 BOM + 转义修复）。"""
+        target = str((ROOT / "scripts" / "install_prereqs.ps1").resolve()).replace("'", "''")
+        script = tmp_path / "parse_prereqs.ps1"
+        script.write_text(
+            "$t = $null; $e = $null\n"
+            f"[void][System.Management.Automation.Language.Parser]::ParseFile('{target}', [ref]$t, [ref]$e)\n"
+            "if ($e -and $e.Count) {\n"
+            "    $e | ForEach-Object { Write-Output (\"line \" + $_.Extent.StartLineNumber + \": \" + $_.Message) }\n"
+            "    exit 1\n"
+            "}\n"
+            'Write-Output "PARSE_OK"\n',
+            encoding="utf-8",
+        )
+
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            capture_output=True, text=True, timeout=120,
+        )
+
+        assert proc.returncode == 0, (
+            f"PS 5.1 解析 install_prereqs.ps1 失败：\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+        )
+        assert "PARSE_OK" in proc.stdout
+
+
+class TestReadmeHasNoReleaseSection:
+    """仓库已不再发布 Release —— README 里就不能再教用户「从 Release 装」。
+
+    2026-10-30 起 GitHub 上所有历史 Release 与版本 tag 都已删除（只保留
+    `pre-token-optimization` 这个回滚锚点）。README 里残留的下载链接会 404，
+    而客群是电脑小白 —— 404 等于「装不上」。
+    """
+
+    @pytest.mark.parametrize("name", ["README.md", "README.en.md"])
+    def test_no_releases_link(self, name):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        assert "github.com/chefroger/smart%2Dtrade%2Dai/releases" not in text, (
+            f"{name} 仍指向已删除的 Releases 页面"
+        )
+
+    @pytest.mark.parametrize("name", ["README.md", "README.en.md"])
+    def test_no_pinned_version_clone(self, name):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        assert "git clone --branch v0" not in text, (
+            f"{name} 仍在教用户克隆已删除的版本 tag"
+        )
+
+
+class TestNoBareVarBeforeMultibyte:
+    """`$var` 后面**紧跟多字节字符**时必须写成 `${var}`。
+
+    2026-10-16 实测（macOS 自带 GNU bash 3.2.57）：它解析变量名时不认 UTF-8
+    边界 —— `$_old_ver，` 会把中文逗号的首字节 `\\xef` 吞进变量名，整个展开成空。
+    用户看到的是：
+
+        已有的运行环境是 Python ，需要 3.14      ← 版本号整段消失
+
+    而 `✓ Python 3.14（/path/to/python）`（每次安装都会打印）也被截成乱码。
+    加花括号即正常（`${_old_ver}，` ✓）—— 所以这不是「bash 太老」，是写法没有
+    把变量名边界说清楚，在任何版本上都值得写对。
+
+    只查**代码行**：注释里的同类写法不参与输出，改了没有收益。
+    """
+
+    def test_sh_has_no_bare_var_before_multibyte(self):
+        import re
+
+        offenders: list[str] = []
+        for lineno, line in enumerate(SH.splitlines(), start=1):
+            if line.strip().startswith("#"):
+                continue
+            for m in re.finditer(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]", line):
+                offenders.append(f"{lineno}: {m.group()!r} — {line.strip()[:70]}")
+
+        assert not offenders, (
+            "install.sh 里有 `$var` 紧跟多字节字符（bash 3.2 下会吞掉字符）：\n  "
+            + "\n  ".join(offenders)
+            + "\n  改用 ${var} 明确变量名边界。"
+        )
+
+    def test_guard_itself_catches_the_bug_shape(self):
+        """守卫自身的回归：确认它能匹配到当初那个 bug 写法。
+
+        一个永远通过的守卫比没有守卫更糟 —— 它给人虚假的安全感。
+        """
+        import re
+
+        bug = 'log_warn "已有的运行环境是 Python $_old_ver，需要 3.14"'
+        assert re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]", bug), (
+            "守卫匹配不到当初的 bug 写法，已失效"
+        )
+        # 反例：加了花括号就不该被报
+        fixed = 'log_warn "已有的运行环境是 Python ${_old_ver}，需要 3.14"'
+        assert not re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]", fixed), (
+            "守卫把已经修好的写法也报了"
+        )

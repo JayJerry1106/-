@@ -1,0 +1,5 @@
+theme: jekyll-theme-slate
+title: 路路通ai助手
+description: "外贸业务员的 AI 助手 — 本地运行，数据安全"
+logo: docs/screenshot-2.png
+show_downloads: false
