@@ -1,0 +1,200 @@
+"""
+路路通ai助手 — OSINT Layer 5: 技术栈检测（BuiltWith-style）。
+
+通过 HTTP 响应头和 HTML 内容正则匹配，检测网站使用的技术栈、
+平台类型和 SSL 状态。纯 urllib + re 实现，无需第三方库。
+"""
+
+from __future__ import annotations
+
+import re
+import urllib.parse
+import urllib.request
+
+from trade.osint.constants import FREE_PLATFORMS, _is_private_host
+
+
+def detect_tech_stack(url: str, *, opener=None) -> dict:
+    """BuiltWith 风格技术栈检测。
+
+    通过 HTTP 请求获取页面 HTML 和响应头，用正则匹配检测技术栈特征。
+
+    Args:
+        url: 网站 URL（如 "https://example.com"，自动补全协议）
+
+    Returns:
+        {
+            "url": str,
+            "technologies": list[str],        # 检测到的技术列表
+            "platforms": list[str],           # 平台类型（Shopify / WordPress 等）
+            "is_free_platform": bool,        # True = 🚩 免费建站工具
+            "is_enterprise": bool,            # True = ✅ 企业级平台
+            "ssl_valid": bool,               # SSL 证书是否有效
+            "server": str | None,            # 服务器类型（如 nginx/apache）
+            "error": str | None,
+        }
+    """
+    # 自动补全协议
+    if not url.startswith(("http://", "https://")):
+        # 用户未输入协议前缀，默认添加 HTTPS
+        url = "https://" + url
+
+    result: dict = {
+        "url": url,
+        "technologies": [],
+        "platforms": [],
+        "is_free_platform": False,
+        # 默认 False：只有真的抓到页面并检出企业级技术时才置 True（见下方
+        # `any(t in technologies for t in enterprise_indicators)`）。
+        # 历史上这里默认 True —— 抓取失败时 except 只写 error、不改这个值，
+        # 于是报告输出「✅ 网站使用企业级技术栈，可信度 +1」：**域名被墙反而加分**。
+        "is_enterprise": False,
+        "ssl_valid": False,
+        "server": None,
+        "error": None,
+    }
+
+    try:
+        # SSRF 防护：拒绝访问内网/保留 IP
+        parsed = urllib.parse.urlparse(url)
+        hostname = parsed.hostname or ""
+        if _is_private_host(hostname):
+            result["error"] = f"Blocked: {hostname} resolves to a private/reserved IP"
+            return result
+
+        # 不要在进程级改 socket 默认超时（会影响同进程的 Hermes/其它网络调用）；
+        # 每个请求单独传 timeout。
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Trade-AI/1.0)"},
+        )
+        # 测试可注入 opener（见签名）；生产用带重定向复查的 safe opener
+        from trade.osint.constants import _MAX_BODY_BYTES, _SAFE_OPENER
+
+        _open = opener or _SAFE_OPENER.open
+        with _open(req, timeout=15) as resp:
+            result["ssl_valid"] = True
+            # 从响应头提取服务器信息
+            server_header = resp.headers.get("Server", "")
+            if server_header:
+                # HTTP 响应头中包含 Server 字段，记录服务器类型
+                result["server"] = server_header
+
+            try:
+                body = resp.read(_MAX_BODY_BYTES)
+            except TypeError:
+                # 测试桩的 read() 不接受 size 参数
+                body = resp.read()
+            html_content = body.decode("utf-8", errors="replace")
+
+        # 从 HTML 中检测技术栈特征
+        technologies = _detect_technologies(html_content)
+
+        # 判断是否为免费/托管建站平台。
+        #
+        # **别拿检测名去比 FREE_PLATFORMS**：那个集合里存的是**域名**
+        # （"shopify.com"、"wix.com"…），而 technologies 里是**名字**（"Shopify"）
+        # —— 旧写法 `t.lower() in [...FREE_PLATFORMS]` 恒为 False，
+        # 这个"低预算公司"红旗**从来没有触发过**（2026-10-13 实测发现）。
+        # 正确做法：拿域名去页面源码里找 —— 建站平台的资源域名一定会出现在
+        # asset URL / 页脚里，这也正是这个信号的本意。
+        html_lower = html_content.lower()
+        free_platforms_detected = [p for p in FREE_PLATFORMS if p.lower() in html_lower]
+        result["is_free_platform"] = len(free_platforms_detected) > 0
+
+        # 识别建站平台类别
+        platform_names = {
+            "Shopify", "WooCommerce", "Wix", "Squarespace", "WordPress", "Drupal",
+            "Joomla", "Webflow", "Strikingly",
+        }
+        result["platforms"] = [t for t in technologies if t in platform_names]
+
+        # 企业级判断：有 Stripe/PayPal/HubSpot/Salesforce 等企业级服务
+        enterprise_indicators = [
+            "Stripe", "PayPal", "HubSpot", "Salesforce", "Marketo",
+            "Zendesk", "Cloudflare", "Akamai",
+        ]
+        # 检测到企业级服务（Stripe/PayPal/HubSpot/Salesforce 等），标注为企业级客户
+        result["is_enterprise"] = any(t in technologies for t in enterprise_indicators)
+
+        result["technologies"] = technologies[:30]  # 最多 30 个
+
+    except Exception as exc:
+        # HTTP 请求失败（超时、DNS 解析错误、SSL 问题等），记录错误信息
+        result["error"] = str(exc)
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 技术栈检测模式表
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 支持的技术检测模式：正则 → 技术名
+#
+# **精度要求（2026-10-13 起）：喂给可信度评分的信号必须"域名/路径锚定"。**
+# 裸产品名（`shopify`、`stripe`、`paypal`…）会让页面**只要提到**这个词就被判成用了它 ——
+# 实测两例：github.com 被判成 Shopify、wordpress.com 的集成列表页把
+# Hotjar/HubSpot/Salesforce 全点亮。危害不只是列表难看：`is_enterprise` 会触发
+# 「✅ 网站使用企业级技术栈，可信度 +1」，**误报等于给可疑网站加分**（假绿灯）。
+# 锚定的判据：真实的资源 URL / 路径特征（cdn.shopify.com、js.stripe.com…），
+# 而不是正文里出现过的字眼。
+_TECH_PATTERNS: list[tuple[str, str]] = [
+    # 建站平台
+    (r"cdn\.shopify\.com|myshopify\.com|shopifycdn|shopify\.com/s/files", "Shopify"),
+    (r"wp-content|wp-includes", "WordPress"),
+    (r"wix\.com|wixstatic\.com", "Wix"),
+    (r"squarespace\.com|static1\.squarespace\.com|sqsp\.net", "Squarespace"),
+    (r"strikingly\.com|strikinglycdn", "Strikingly"),
+    (r"wp-content/plugins/woocommerce|woocommerce-page|wc-ajax", "WooCommerce"),
+    (r"sites/default/files|drupal-settings-json|core/misc/drupal", "Drupal"),
+    (r"/media/jui/|joomla-script-options|/components/com_", "Joomla"),
+    (r"laravel_session|/vendor/laravel|livewire", "Laravel"),
+    # 前端框架（仅信息展示，不参与可信度评分；保持宽松以保召回）
+    (r"react|reactjs", "React"),
+    (r"vue\.js|vuejs", "Vue.js"),
+    (r"angular", "Angular"),
+    (r"next\.js", "Next.js"),
+    (r"bootstrap", "Bootstrap"),
+    (r"tailwind", "Tailwind CSS"),
+    (r"jquery", "jQuery"),
+    # CDN / 安全
+    (r"cdn-cgi/|__cfduid|cf-ray", "Cloudflare"),   # 被 CF 代理的站点会带 /cdn-cgi/ 注入
+    (r"akamaihd\.net|akamaized\.net|akamai\.net", "Akamai"),
+    (r"fastly\.net|fastlylb", "Fastly"),
+    # 支付
+    (r"js\.stripe\.com|api\.stripe\.com|stripe\.com/v3", "Stripe"),
+    (r"paypalobjects\.com|paypal\.com/sdk|paypal\.com/webstatic", "PayPal"),
+    # 分析 / 营销
+    (r"google-tag-manager|googletagmanager\.com", "Google Tag Manager"),
+    (r"google-analytics\.com|analytics\.js|ga\.js", "Google Analytics"),
+    (r"facebook\.com/tr|connect\.facebook\.net", "Facebook Pixel"),
+    (r"static\.hotjar\.com|hotjar\.com/c/|hjsiteSettings", "Hotjar"),
+    (r"js\.hs-scripts\.com|hs-analytics|hsforms\.net|hubspot\.com/forms", "HubSpot"),
+    (r"marketo\.com|mktoresp\.com|mktoForms", "Marketo"),
+    # CRM / 客服
+    (r"zdassets\.com|zendesk\.com|zopim\.com", "Zendesk"),
+    (r"\.salesforce\.com|force\.com|salesforceliveagent", "Salesforce"),
+    (r"shopify-api|shopify-checkout", "Shopify API"),
+]
+
+
+def _detect_technologies(html_content: str) -> list[str]:
+    """从 HTML 内容中检测技术栈特征。
+
+    Args:
+        html_content: 网页 HTML 文本
+
+    Returns:
+        去重后的技术名列表
+    """
+    html_lower = html_content.lower()
+    technologies: list[str] = []
+
+    for pattern, tech_name in _TECH_PATTERNS:
+        if re.search(pattern, html_lower, re.IGNORECASE):
+            # 正则匹配到技术特征，且尚未添加到列表时，追加技术名
+            if tech_name not in technologies:
+                technologies.append(tech_name)
+
+    return technologies

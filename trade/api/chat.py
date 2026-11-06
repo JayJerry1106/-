@@ -1,0 +1,779 @@
+"""
+路路通ai助手 — AI 聊天 API 路由。
+
+端点：
+  POST /chat         — 同步聊天（线程池 + 600s 超时）
+  POST /chat/stream  — SSE 流式聊天（asyncio.Queue + 心跳 + 断连取消）
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json as _json
+import logging
+import threading
+import time
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi.responses import StreamingResponse
+
+from trade import chat_memory
+from trade import library as library_module
+from trade import usage as usage_module
+from trade.agent_context import bind_company, extract_user_paths
+from trade.api.deps import require_company
+from trade.api.models import ChatRequest
+from trade.document_task import (
+    DocumentTask,
+    format_incomplete_report,
+    should_enforce_document_gate,
+)
+from trade.helpers import build_query, create_agent
+from trade.hermes_compat import release_read_coverage, snapshot_read_coverage
+from trade.prompt import detect_reply_language
+from trade.read_evidence import ReadEvidenceCollector
+
+_log = logging.getLogger(__name__)
+
+router = APIRouter(tags=["chat"])
+
+# SSE 流的 agent 兜底超时（秒）。网站诊断等长任务也应在该时限内完成；
+# 超时后必须下发 error 事件并中止 agent，不能让流无声结束。
+# 提为模块常量是为了可测 —— 超时路径以前没有测试覆盖（它的 error 事件曾被丢弃）。
+_STREAM_DEADLINE_SECONDS = 1800.0
+
+# 同步聊天的 Agent 兜底超时（秒）。提为模块常量以便测试缩短。
+_SYNC_TIMEOUT_SECONDS = 600.0
+
+
+def _external_paths_hint(paths: list[str]) -> str:
+    """用户本轮贴出外部文件时追加的提示：只读授权 + 敏感信息不复述。"""
+    listed = "\n".join(f"- {p}" for p in paths)
+    return (
+        "## 本轮用户显式贴出的文件\n"
+        "用户已在消息里亲手给出下列文件路径，本轮可只读访问这些精确文件：\n"
+        f"{listed}\n"
+        "只能读这些文件本身，不能据此访问目录、其它文件或执行它们。\n"
+        "回答或写草稿时不要复述密码、密钥、token 原文；需要提及时打码或只讲结论。"
+    )
+
+
+def _path_under(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _classify_user_paths(query: str, cid: int) -> list[str]:
+    """用户本轮亲手贴出、且允许 AI 只读访问的文件清单。
+
+    2026-10-29 起不再有「待确认」往返：用户贴出路径本身就是授权
+    （自己电脑上的自己的文件，不需要再打一句「确认读取」）。
+    仍保留一条：~/.trade 下但不是本公司目录（其它公司/全局数据）不进清单 ——
+    多公司隔离是产品口径，不因放宽守卫而放开。
+    """
+    from trade.helpers import _allowed_path_roots
+    from trade.post_install.skills import _get_trade_home
+
+    paths = extract_user_paths(query)
+    if not paths:
+        return []
+
+    roots: list[Path] = []
+    try:
+        for root in _allowed_path_roots(cid):
+            try:
+                roots.append(Path(root).resolve())
+            except OSError:
+                continue
+    except Exception:
+        roots = []
+    try:
+        trade_home = Path(_get_trade_home()).resolve()
+    except Exception:
+        trade_home = None
+
+    allowed: list[str] = []
+    for raw in paths:
+        path = Path(raw)
+        # ~/.trade 下、但不是本公司目录：其它公司数据 / 全局数据，硬拦
+        if trade_home is not None and _path_under(path, trade_home) and not any(
+            _path_under(path, root) for root in roots
+        ):
+            continue
+        allowed.append(raw)
+    return allowed
+
+
+def _abort_running_agent(agent) -> None:
+    """超时 / 客户端放弃后，尽力让仍在跑的 agent 停下来（审计 P1-21）。
+
+    只 set 一个取消标记是不够的：`run_in_executor` 的 Future 取消**停不掉线程**，
+    `agent.chat()` 里正在执行的工具调用会继续跑、继续烧 token。Hermes 提供了
+    跨线程的 `interrupt()` / `hard_interrupt()`（工具侧按线程检查中断位），
+    这是唯一真正能让工具停下的手段。
+
+    但它们是上游内部 API：新旧版本可能没有。拿不到就只靠调用方的取消标记
+    挡住重试与落库 —— 中断失败绝不能让超时响应变成 500。
+    """
+    if agent is None:
+        return
+    for attempt in (
+        lambda: agent.hard_interrupt("trade: request timed out"),
+        lambda: agent.interrupt("trade: request timed out", hard_cancel=True),
+        lambda: agent.interrupt("trade: request timed out"),
+    ):
+        try:
+            attempt()
+            return
+        except (AttributeError, TypeError):
+            continue  # 该版本没有这个方法/签名，换下一种
+        except Exception:
+            _log.warning("Failed to interrupt timed-out agent", exc_info=True)
+            return
+
+# ── 简单内存限流（per-process，按公司隔离）──────────────────────────────────
+# 每个公司 60 秒窗口内最多 20 次 chat 请求（含 sync + SSE）
+_MAX_CHAT_PER_MINUTE = 20
+_WINDOW_SECONDS = 60.0
+_chat_timestamps: dict[int, list[float]] = {}  # company_id → [timestamps]
+_rate_limit_lock = threading.Lock()
+
+# 定期清理：每小时扫描一次，删除超过 1 小时无活跃时间戳的 company entry，
+# 防止 _chat_timestamps 和 _last_skill_per_company 无界增长导致内存泄漏。
+# 阈值 3600s 远大于限流窗口 60s，不会误清活跃公司。
+_STALE_THRESHOLD = 3600.0
+
+def _cleanup_rate_limit_dicts():
+    while True:
+        time.sleep(3600)
+        now = time.time()
+        with _rate_limit_lock:
+            stale = [
+                cid for cid, stamps in _chat_timestamps.items()
+                if not stamps or all(now - t > _STALE_THRESHOLD for t in stamps)
+            ]
+            for cid in stale:
+                del _chat_timestamps[cid]
+        # 同时清理 skill 缓存中超过阈值的 company entry
+        with _skill_cache_lock:
+            # 只能清理在 _chat_timestamps 中也被清理的条目，
+            # 确保活跃公司的 skill 缓存不会被误删
+            for cid in stale:
+                _last_skill_per_company.pop(cid, None)
+
+# 进程内 skill 缓存：记录每个 company 上次使用的 skill 名称，用于跳过重复注入
+_last_skill_per_company: dict[int, str] = {}
+_skill_cache_lock = threading.Lock()
+
+_cleanup_thread = threading.Thread(target=_cleanup_rate_limit_dicts, daemon=True)
+_cleanup_thread.start()
+
+
+def _check_chat_rate_limit(company_id: int) -> bool:
+    """检查指定公司是否超过 chat 限流阈值。返回 True 表示允许继续。"""
+    global _chat_timestamps
+    now = time.time()
+    with _rate_limit_lock:
+        stamps = _chat_timestamps.get(company_id, [])
+        stamps = [t for t in stamps if now - t < _WINDOW_SECONDS]
+        if len(stamps) >= _MAX_CHAT_PER_MINUTE:
+            _chat_timestamps[company_id] = stamps
+            return False
+        stamps.append(now)
+        _chat_timestamps[company_id] = stamps
+        return True
+
+
+def _extract_and_cache_skill(cid: int, full_query: str, skill_hint: str | None) -> str | None:
+    """从 build_query 输出中提取当前匹配的 skill 名称并缓存。
+
+    同步和流式端点共享此逻辑，避免重复 ~10 行 regex 提取代码。
+    OSINT 场景：skill_hint 中有 "## 当前技能：{name}"
+    非 OSINT 场景：full_query 中有 "## 技能触发：{name}"
+    """
+    import re as _re
+    _skill_match = (
+        _re.search(r'##\s*当前技能[：:]\s*(\S+)', skill_hint or '') or
+        _re.search(r'##\s*技能触发[：:]\s*(\S+)', full_query)
+    )
+    current_skill = _skill_match.group(1) if _skill_match else None
+    with _skill_cache_lock:
+        if current_skill:
+            _last_skill_per_company[cid] = current_skill
+    return current_skill
+
+def _validate_scope(payload, cid: int) -> None:
+    """校验 payload 里的 customer_id / library_id 属于当前公司。
+
+    不校验会在切公司后产生"公司 B + 客户 A"的错标行，之后按客户过滤时
+    反而把它当作 A 的历史读出（2026-10-25 审计 P1-19）。
+    """
+    if payload.customer_id is not None:
+        from trade import customer as customer_module
+
+        if not customer_module.get(payload.customer_id, company_id=cid):
+            raise HTTPException(
+                status_code=400,
+                detail="customer_id does not belong to the current company.",
+            )
+    if payload.library_id is not None:
+        if not library_module.get(payload.library_id, company_id=cid):
+            raise HTTPException(
+                status_code=400,
+                detail="library_id does not belong to the current company.",
+            )
+
+
+def _document_gate(document_task, request_task_id: str, collector):
+    """取读取证据并判定完成度；两份来源都没有证据时返回 None（降级放行）。
+
+    优先用 Hermes 的读取快照（含页数/Sheet/扫描页等结构化信息）。公开版
+    Hermes 没有这个对外接口，回退到工具回调自收集的证据，这样不依赖
+    Hermes 上游改动也能做完整性判定。
+    """
+    hermes_evidence = snapshot_read_coverage(request_task_id)
+    if hermes_evidence:
+        return document_task.evaluate(hermes_evidence)
+    if collector is not None:
+        collected = collector.snapshot()
+        if collected:
+            return document_task.evaluate(collected)
+    _log.warning("No read evidence available; document gate skipped")
+    return None
+
+
+@router.get("/usage/today")
+def usage_today(response: Response, cid: int = Depends(require_company)):
+    """今日 token 用量（仅提示，不拦截聊天）。
+
+    上限只影响界面配色与文案（超过后标红），聊天照常执行 —— 用户 2026-10-26
+    明确要求「提示但不拦」。
+
+    必须是 no-store：额度每天在变、后台代码升级后阈值也会变，浏览器拿旧响应
+    会一直显示旧值（实测升级后仍显示 2,000,000）。
+    """
+    response.headers["Cache-Control"] = "no-store"
+    used, limit = usage_module.daily_budget_state(cid)
+    return {
+        "used": used,
+        "limit": limit,  # 0 = 不限
+        "exceeded": bool(limit and used >= limit),
+    }
+
+
+# ── 同步聊天 ──────────────────────────────────────────────────────────────
+
+@router.post("/chat")
+async def trade_chat(
+    payload: ChatRequest,
+    cid: int = Depends(require_company),
+):
+    """同步聊天。"""
+    from trade.license import check_license
+    lic_ok, lic_msg = check_license(cid)
+    if not lic_ok:
+        raise HTTPException(status_code=402, detail=lic_msg)
+
+    query = payload.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    if not _check_chat_rate_limit(cid):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后重试。")
+    _validate_scope(payload, cid)
+
+    # 读取上次使用的 skill 名称（用于跳过重复注入）
+    with _skill_cache_lock:
+        last_skill = _last_skill_per_company.get(cid)
+
+    full_query, skill_hint = build_query(
+        cid, payload.library_id, query, customer_id=payload.customer_id,
+        last_skill_name=last_skill,
+        # 回复语言跟随**用户这句话**：中文回中文、英文回英文；
+        # 界面语言只作「判不出来时」的兜底（2026-11-02 口径）。
+        language=detect_reply_language(query, payload.language or "zh"),
+    )
+    # 用户本轮亲手贴出的文件 → 直接只读放行（贴出来即授权，不再二次确认）
+    user_paths = _classify_user_paths(query, cid)
+    if user_paths:
+        skill_hint = (skill_hint or "") + "\n\n" + _external_paths_hint(user_paths)
+
+    # 从 full_query 或 skill_hint 中提取当前匹配的 skill 名称并缓存
+    current_skill = _extract_and_cache_skill(cid, full_query, skill_hint)
+    document_task = None
+    if payload.library_id and should_enforce_document_gate(query):
+        library = library_module.get(payload.library_id, company_id=cid)
+        if library:
+            document_task = DocumentTask.from_root(library["root_path"])
+            if document_task.truncated or not document_task.files:
+                # 目录过大或没有可分析文件：无法可靠判定完整性，退回普通问答。
+                _log.info("Document gate skipped (truncated=%s, files=%d)",
+                          document_task.truncated, len(document_task.files))
+                document_task = None
+
+    _MAX_AGENT_RETRIES = 2  # 最多重试 2 次（共 3 次尝试），与 SSE 流式端点保持一致
+
+    request_task_id = f"trade-doc-{cid}-{time.time_ns()}" if document_task else None
+    # 回调收集的证据：公开版 Hermes 没有对外读取快照接口，靠这个兜底。
+    evidence = ReadEvidenceCollector() if document_task else None
+
+    # 超时后主线程要靠它中断仍在跑的 agent；列表用于跨线程传引用
+    agent_holder: list = []
+    cancelled = threading.Event()
+
+    def _call_agent() -> tuple[str, bool]:
+        """返回 (回复文本, 是否成功)；失败文本不得用于门禁判定。"""
+        last_error = ""
+        for attempt in range(_MAX_AGENT_RETRIES + 1):
+            # 已超时：不再发起新尝试（用户早已拿到"已中止"）
+            if cancelled.is_set():
+                return "", False
+            try:
+                agent = create_agent(
+                    ephemeral_system_prompt=skill_hint,
+                    skill_name=current_skill,
+                    tool_start_callback=evidence.on_start if evidence else None,
+                    tool_complete_callback=evidence.on_complete if evidence else None,
+                )
+                agent_holder.clear()
+                agent_holder.append(agent)
+                # 守卫不可用时不允许跑工具（agent 已构造，插件钩子能力此刻已知）
+                from trade.bootstrap import tool_guard_chat_block_reason
+
+                block_reason = tool_guard_chat_block_reason()
+                if block_reason:
+                    return block_reason, False
+                # 构造期间已超时：别再启动这一轮（主线程的 abort 会正好错过它）
+                if cancelled.is_set():
+                    return "", False
+                # 绑定公司身份：chat-memory 等插件工具只认服务端绑定，
+                # 不再信任模型自填的 company_id（审计 P0-2）。
+                try:
+                    with bind_company(
+                        cid, payload.customer_id,
+                        user_paths=user_paths,
+                    ):
+                        if document_task and request_task_id:
+                            result = agent.run_conversation(full_query, task_id=request_task_id)["final_response"]
+                        else:
+                            result = agent.chat(full_query)
+                finally:
+                    # 不论成功/失败（含被中断）都把这次尝试的 token 记账：
+                    # 失败的重试同样烧钱，漏记会让额度形同虚设（审计 P1-16）。
+                    usage_module.record_agent_usage(
+                        agent, company_id=cid, skill=current_skill or "",
+                    )
+                if cancelled.is_set():
+                    # 超时后迟到的结果：用户已收到中止提示，不能再当成功回复
+                    return "", False
+                if result:
+                    return result, True
+                if attempt < _MAX_AGENT_RETRIES:
+                    _log.warning("Agent returned empty, retry %d/%d", attempt + 1, _MAX_AGENT_RETRIES)
+                    time.sleep(2 ** attempt)
+                    continue
+                return "Agent 返回了空响应。", False
+            except ImportError:
+                return "⚠️ AI Agent 模块未加载。", False
+            except RuntimeError as e:
+                last_error = str(e)
+                if attempt < _MAX_AGENT_RETRIES:
+                    _log.warning("Agent RuntimeError, retry %d/%d: %s", attempt + 1, _MAX_AGENT_RETRIES, e)
+                    time.sleep(2 ** attempt)
+                    continue
+                return f"⚠️ {e}", False
+            except Exception as e:
+                last_error = str(e) or f"Agent call failed (attempt {attempt + 1})"
+                _log.exception("Agent call failed (attempt %d/%d)", attempt + 1, _MAX_AGENT_RETRIES)
+                if attempt < _MAX_AGENT_RETRIES:
+                    time.sleep(2 ** attempt)
+                    continue
+            except BaseException as e:
+                # 与 _run_agent（stream）对称：Hermes 可能以 BaseException 结束，例如
+                # hermes_bootstrap 的 RelaunchExit 继承 SystemExit。它穿过
+                # asyncio.wait_for 后，uvicorn 的 ExceptionMiddleware 同样只捕
+                # Exception → 会一路穿透到 ASGI 栈，最坏情况整个服务进程退出。
+                # 同步端点没有"稍后重试"的余地，如实上报即可。
+                _log.error(
+                    "Agent terminated with %s: %s", type(e).__name__, e, exc_info=True
+                )
+                return f"⚠️ Agent 异常终止（{type(e).__name__}）：{e}", False
+        fallback = f"⚠️ Agent 调用失败: {last_error}" if last_error else "⚠️ Agent 调用失败，请稍后重试。"
+        return fallback, False
+
+    loop = asyncio.get_running_loop()
+    agent_ok = True
+    try:
+        response, agent_ok = await asyncio.wait_for(
+            loop.run_in_executor(None, _call_agent),
+            timeout=_SYNC_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        # Future 取消停不掉线程：先置取消标记（挡住重试与落库），
+        # 再尽力中断 agent，让正在跑的工具调用停下来（审计 P1-21）。
+        cancelled.set()
+        _abort_running_agent(agent_holder[0] if agent_holder else None)
+        response, agent_ok = "⏰ Agent 执行时间过长（超过 10 分钟），已自动中止。请简化问题后重试。", False
+
+    gate_result = None
+    incomplete = False
+    if document_task and request_task_id:
+        try:
+            if agent_ok:
+                gate_result = _document_gate(document_task, request_task_id, evidence)
+                if gate_result is not None and gate_result.status == "incomplete":
+                    # 不通过时把原因作为回答返回，既不丢用户提问也不给不完整结论。
+                    incomplete = True
+                    response = format_incomplete_report(gate_result)
+        finally:
+            # 释放 Hermes 侧该请求的读取记录，避免长驻进程内无限累积。
+            release_read_coverage(request_task_id)
+
+    lib_name = ""
+    if payload.library_id:
+        lib = library_module.get(payload.library_id, company_id=cid)
+        if lib:
+            lib_name = lib["name"]
+
+    # 失败兜底文案（超时 / 模块未加载 / Agent 异常）不写入历史：
+    # 它们不是对用户的回答，存档后会被后续轮次当作上下文注入（审计 P1-21）。
+    conv = None
+    if agent_ok:
+        conv = chat_memory.save_with_context(
+            company_id=cid, library_id=payload.library_id, query=query,
+            response=response, library_name=lib_name,
+            customer_id=payload.customer_id,
+            files_read=([{"file": path, "status": "complete"} for path in gate_result.complete]
+                        if gate_result else None),
+            context=payload.context or "",
+            skill=current_skill or "",
+        )
+    payload_out = {"response": response, "conversation": conv}
+    if gate_result is not None:
+        payload_out["analysis_skipped"] = gate_result.skipped
+        if gate_result.coverage_note:
+            # 能力边界如实披露（原版 Hermes 无结构化读取快照时）
+            payload_out["analysis_note"] = gate_result.coverage_note
+        if incomplete:
+            payload_out["analysis_incomplete"] = True
+    return payload_out
+
+
+# ── SSE 流式聊天 ──────────────────────────────────────────────────────────
+
+@router.post("/chat/stream")
+async def trade_chat_stream(
+    payload: ChatRequest,
+    cid: int = Depends(require_company),
+):
+    """SSE 流式聊天，实时推送 Agent 工具调用进度。
+
+    使用 asyncio.Queue + call_soon_threadsafe 替代 queue.Queue + executor 轮询，
+    每条 SSE 连接只占用 1 条线程。客户端断连时通过 CancelledError 取消 agent。
+    """
+    from trade.license import check_license
+    lic_ok, lic_msg = check_license(cid)
+    if not lic_ok:
+        raise HTTPException(status_code=402, detail=lic_msg)
+
+    query = payload.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    if not _check_chat_rate_limit(cid):
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后重试。")
+    _validate_scope(payload, cid)
+
+    # 读取上次使用的 skill 名称（用于跳过重复注入）
+    with _skill_cache_lock:
+        last_skill = _last_skill_per_company.get(cid)
+
+    full_query, skill_hint = build_query(
+        cid, payload.library_id, query, customer_id=payload.customer_id,
+        last_skill_name=last_skill,
+        # 回复语言跟随**用户这句话**：中文回中文、英文回英文；
+        # 界面语言只作「判不出来时」的兜底（2026-11-02 口径）。
+        language=detect_reply_language(query, payload.language or "zh"),
+    )
+    # 用户本轮亲手贴出的文件 → 直接只读放行（贴出来即授权，不再二次确认）
+    user_paths = _classify_user_paths(query, cid)
+    if user_paths:
+        skill_hint = (skill_hint or "") + "\n\n" + _external_paths_hint(user_paths)
+
+    # 从 full_query 或 skill_hint 中提取当前匹配的 skill 名称并缓存
+    current_skill = _extract_and_cache_skill(cid, full_query, skill_hint)
+    document_task = None
+    if payload.library_id and should_enforce_document_gate(query):
+        library = library_module.get(payload.library_id, company_id=cid)
+        if library:
+            document_task = DocumentTask.from_root(library["root_path"])
+            if document_task.truncated or not document_task.files:
+                # 目录过大或没有可分析文件：无法可靠判定完整性，退回普通问答。
+                _log.info("Document gate skipped (truncated=%s, files=%d)",
+                          document_task.truncated, len(document_task.files))
+                document_task = None
+    request_task_id = f"trade-doc-{cid}-{time.time_ns()}" if document_task else None
+    # 回调收集的证据：公开版 Hermes 没有对外读取快照接口，靠这个兜底。
+    evidence = ReadEvidenceCollector() if document_task else None
+
+    loop = asyncio.get_running_loop()
+    event_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+
+    def _emit_threadsafe(event_type: str, data: dict | None = None):
+        """工作线程通过 call_soon_threadsafe 投递到 asyncio queue。
+
+        put_nowait 在队列满时抛出 QueueFull，用 call_soon_threadsafe 回调时不好捕获，
+        改为 queue.put_nowait 包装在一次非阻塞 try 中，满则静默丢弃（优先保持 SSE 连接稳定）。
+        """
+        def _safe_put(ev_type, ev_data):
+            try:
+                event_queue.put_nowait((ev_type, ev_data))
+            except asyncio.QueueFull:
+                _log.warning("SSE event queue full, dropping event: %s", ev_type)
+
+        loop.call_soon_threadsafe(_safe_put, event_type, data or {})
+
+    def _tool_start(tc_id, name, args):
+        if evidence is not None:
+            evidence.on_start(tc_id, name, args)
+        _emit_threadsafe("tool_start", {"tool_call_id": tc_id, "name": name, "args": args})
+
+    def _tool_complete(tc_id, name, args, result):
+        # 证据收集与 SSE 推送解耦：队列满丢事件不影响完整性判定。
+        if evidence is not None:
+            evidence.on_complete(tc_id, name, args, result)
+        preview = ""
+        if isinstance(result, str):
+            preview = result[:300]
+        elif isinstance(result, (list, dict)):
+            preview = _json.dumps(result, ensure_ascii=False)[:300]
+        _emit_threadsafe("tool_complete", {
+            "tool_call_id": tc_id, "name": name, "result_preview": preview,
+        })
+
+    _MAX_AGENT_RETRIES = 2
+    cancel_event = threading.Event()  # 客户端断连时置位，阻止重试继续浪费 token
+    agent_holder: list = []  # 断连/超时时靠它中断仍在跑的 agent（见 _abort_running_agent）
+
+    def _run_agent() -> str | None:
+        last_error = ""
+        for attempt in range(_MAX_AGENT_RETRIES + 1):
+            # 客户端已断连，立即停止重试循环
+            if cancel_event.is_set():
+                _log.info("Agent cancelled by client disconnect, attempt %d", attempt + 1)
+                return None
+            try:
+                if attempt == 0:
+                    _emit_threadsafe("thinking", {"message": "正在分析问题..."})
+                else:
+                    _emit_threadsafe("thinking", {"message": f"正在重试（第 {attempt} 次）..."})
+                agent = create_agent(
+                    tool_start_callback=_tool_start,
+                    tool_complete_callback=_tool_complete,
+                    ephemeral_system_prompt=skill_hint,
+                    skill_name=current_skill,
+                )
+                agent_holder.clear()
+                agent_holder.append(agent)
+                # 守卫不可用时不允许跑工具（与同步端点一致）
+                from trade.bootstrap import tool_guard_chat_block_reason
+
+                block_reason = tool_guard_chat_block_reason()
+                if block_reason:
+                    _emit_threadsafe("error", {"message": block_reason})
+                    return None
+                # 断连/超时发生在构造期间：别再启动这一轮
+                if cancel_event.is_set():
+                    return None
+                start = time.time()
+                # 同同步端点：把公司身份绑进本次 agent 调用的上下文。
+                try:
+                    with bind_company(
+                        cid, payload.customer_id,
+                        user_paths=user_paths,
+                    ):
+                        if document_task and request_task_id:
+                            result = agent.run_conversation(full_query, task_id=request_task_id)["final_response"]
+                        else:
+                            result = agent.chat(full_query)
+                finally:
+                    # 断连/失败同样记账：本次尝试的 token 已经花掉了（审计 P1-16）
+                    usage_module.record_agent_usage(
+                        agent, company_id=cid, skill=current_skill or "",
+                    )
+                elapsed = time.time() - start
+
+                if not result and attempt < _MAX_AGENT_RETRIES:
+                    if cancel_event.is_set():
+                        return None
+                    _log.warning("Agent returned empty in stream, retry %d/%d", attempt + 1, _MAX_AGENT_RETRIES)
+                    time.sleep(2 ** attempt)
+                    continue
+
+                gate_result = None
+                if document_task and request_task_id and result:
+                    try:
+                        gate_result = _document_gate(document_task, request_task_id, evidence)
+                        if gate_result is not None:
+                            if gate_result.status == "incomplete":
+                                # 不通过时把原因作为回答下发，不报错也不给不完整结论。
+                                result = format_incomplete_report(gate_result)
+                            _emit_threadsafe("analysis_gate", {
+                                "status": gate_result.status,
+                                "files": gate_result.complete,
+                                "missing": gate_result.missing,
+                                "errors": gate_result.errors,
+                                "skipped": gate_result.skipped,
+                                "coverage_note": gate_result.coverage_note,
+                            })
+                    finally:
+                        # 释放 Hermes 侧该请求的读取记录，避免长驻进程内无限累积。
+                        release_read_coverage(request_task_id)
+
+                lib_name = ""
+                if payload.library_id:
+                    lib = library_module.get(payload.library_id, company_id=cid)
+                    if lib:
+                        lib_name = lib["name"]
+
+                # 客户端已断连/已超时：迟到的回答不能再写进历史 —— 用户已经收到
+                # 中止提示，存档后会被下一轮当上下文注入（复审 P1-21 残口）。
+                if cancel_event.is_set():
+                    return None
+
+                # 先保存对话，再发送响应 —— 确保前端能拿到 conversation_id 做评分
+                conv_id = None
+                try:
+                    conv = chat_memory.save_with_context(
+                        company_id=cid, library_id=payload.library_id,
+                        query=query, response=result or "",
+                        library_name=lib_name,
+                        customer_id=payload.customer_id,
+                        files_read=([{"file": path, "status": "complete"} for path in gate_result.complete]
+                                    if gate_result else None),
+                        context=payload.context or "",
+                        skill=current_skill or "",
+                    )
+                    if conv:
+                        conv_id = conv.get("id")
+                except Exception as exc:
+                    _log.exception("save_with_context failed in stream")
+                    # 不能静默：回答能显示但 conversation_id 为空，评分/引用链路
+                    # 会断，用户却不知道（审计 P2-33）。发一条警告事件让前端提示。
+                    _emit_threadsafe("warning", {
+                        "message": f"对话已回复，但保存到历史失败（{type(exc).__name__}），"
+                                   "本轮无法评分或后续引用。",
+                    })
+
+                _emit_threadsafe("response", {
+                    "text": result or "Agent 返回了空响应。",
+                    "elapsed_sec": round(elapsed, 1),
+                    "conversation_id": conv_id,
+                })
+                return result
+            except ImportError:
+                _emit_threadsafe("error", {"message": "AI Agent 模块未加载。"})
+                return None
+            except RuntimeError as e:
+                last_error = str(e)
+                if attempt < _MAX_AGENT_RETRIES and not cancel_event.is_set():
+                    _log.warning("Agent RuntimeError in stream, retry %d/%d: %s", attempt + 1, _MAX_AGENT_RETRIES, e)
+                    time.sleep(2 ** attempt)
+                    continue
+                _emit_threadsafe("error", {"message": last_error})
+                return None
+            except Exception as e:
+                last_error = str(e) or f"Agent stream failed (attempt {attempt + 1})"
+                _log.exception("Agent stream failed (attempt %d/%d)", attempt + 1, _MAX_AGENT_RETRIES)
+                if attempt < _MAX_AGENT_RETRIES and not cancel_event.is_set():
+                    time.sleep(2 ** attempt)
+                    continue
+                _emit_threadsafe("error", {"message": f"⚠️ {last_error}"})
+                return None
+            except BaseException as e:
+                # Hermes 可能以 BaseException 结束 —— 例如 hermes_bootstrap 的
+                # RelaunchExit 继承 SystemExit（它会把 server.py 重新 exec 到 Hermes
+                # 自带的 store python，而那里没有 trade 包）。`except Exception` 抓不到
+                # 这类异常，agent 线程会静默死亡：前端既收不到 response 也收不到 error，
+                # 只能落兜底文案「Agent 未返回有效回复」（客户机实测，2026-10-08）。
+                # 它也不是瞬时故障，重试无意义，如实上报即可。
+                _log.error(
+                    "Agent terminated with %s: %s", type(e).__name__, e, exc_info=True
+                )
+                _emit_threadsafe(
+                    "error",
+                    {"message": f"⚠️ Agent 异常终止（{type(e).__name__}）：{e}"},
+                )
+                return None
+        _emit_threadsafe("error", {"message": "Agent 重试耗尽，请稍后重试。"})
+        return None
+
+    async def _event_stream():
+        def _sse(ev_type: str, payload: dict) -> str:
+            return f"event: {ev_type}\ndata: {_json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        agent_task = loop.run_in_executor(None, _run_agent)
+        # 30 分钟 Agent 兜底超时 — 网站诊断等长任务也应在 30min 内完成
+        # 超时后发 error 事件并取消 agent，防止永久挂起
+        deadline = time.time() + _STREAM_DEADLINE_SECONDS
+        try:
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    # 直接 yield，不能走 _emit_threadsafe：那条路径要等下一轮事件循环
+                    # 才往队列里 put，而这里紧接着就 break，队列里的 error 永远不会被
+                    # 取到（历史 bug —— 超时后用户只看到「未返回有效回复」，既不知道
+                    # 是超时、也不知道任务已被中止）。
+                    _log.error("Agent stream exceeded %.0fs deadline; aborting", _STREAM_DEADLINE_SECONDS)
+                    yield _sse("error", {"message": "⏰ Agent 执行超过 30 分钟，已自动中止。请简化问题或联系支持。"})
+                    break
+                try:
+                    # 取 15s 心跳与剩余 deadline 的较小值，确保 deadline 到期时能及时触发
+                    wait_sec = min(15.0, remaining)
+                    ev_type, ev_data = await asyncio.wait_for(event_queue.get(), timeout=wait_sec)
+                except TimeoutError:
+                    if agent_task.done():
+                        # 任务已结束、队列里却没有终止事件 —— 说明它是异常收场的。
+                        # 不取 exception() 会让失败彻底静默（还会打出
+                        # "Future exception was never retrieved" 警告），
+                        # 前端只能落到兜底文案。取出来即当作 error 下发。
+                        if not agent_task.cancelled():
+                            exc = agent_task.exception()
+                            if exc is not None:
+                                _log.error("Agent task died without emitting: %r", exc)
+                                yield _sse("error", {
+                                    "message": f"⚠️ Agent 失败（{type(exc).__name__}）：{exc}"
+                                })
+                        break
+                    yield ": ping\n\n"
+                    continue
+
+                yield _sse(ev_type, ev_data)
+                if ev_type in ("response", "error"):
+                    break
+        finally:
+            # 客户端断连 / 超时 / 异常 → 先发取消信号让 Agent 线程退出重试循环，
+            # 再尽力中断它：Future.cancel() 停不掉线程里正在跑的工具调用，
+            # 只有 Hermes 的 interrupt() 能让工具侧看到中断位（审计 P1-21）。
+            cancel_event.set()
+            if not agent_task.done():
+                _abort_running_agent(agent_holder[0] if agent_holder else None)
+                agent_task.cancel()
+                try:
+                    await agent_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )

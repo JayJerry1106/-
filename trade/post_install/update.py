@@ -1,0 +1,1176 @@
+"""
+路路通ai助手 — 一键系统更新。
+
+update_trade() 按序执行 7 个步骤：
+  1. git pull（在运行目录拉取最新代码；拉取前钉选远端 main 的 SHA，
+     拉取后回读 HEAD 必须与之一致，否则中止并回退）
+  2. install_skills()（安装新增的 b2b-* skill 目录 + 模板）
+  3. update_skills()（从 GitHub 同步每个 SKILL.md 内容）
+  4. pip install -e .（更新包及依赖）
+  5. _sync_trade_template()（同步新增的模板文件）
+  6. _ensure_auto_start()（开机自启设置幂等检查）
+  7. 数据库迁移检查
+
+用法：trade-update（或 trade update）
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+import time
+from pathlib import Path
+
+from trade.post_install.skills import (
+    _get_trade_home,
+    install_skills,
+    update_skills,
+)
+
+
+def _pip_env() -> dict:
+    """pip 子进程环境：强制关闭 user-site。
+
+    用户 `~/.config/pip/pip.conf` 里若写了 `no-user = 1`，pip 26 会把它当成
+    `use_user_site="1"`（字符串真值）—— 在 venv 里做 --user 安装必报
+    「Can not perform a '--user' install」，升级第 4 步直接失败并回滚。
+    `--no-user` 是 pip 的隐藏 CLI 开关（优先级高于配置文件）；PIP_USER=0
+    再加一道环境层保险，两者都写死，升级不再受用户 pip 配置影响。
+    """
+    env = dict(os.environ)
+    env["PIP_USER"] = "0"
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    return env
+
+
+def _trade_venv_python() -> Path | None:
+    """Trade 自己的虚拟环境解释器；不存在（或不是 venv）返回 None。"""
+    for base in (_get_trade_home() / "venv", Path.home() / ".trade" / "venv"):
+        if not (base / "pyvenv.cfg").is_file():
+            continue
+        for rel in (("Scripts", "python.exe"), ("bin", "python")):
+            cand = base.joinpath(*rel)
+            if cand.is_file():
+                return cand
+    return None
+
+
+def _pip_python() -> tuple[str, str | None]:
+    """pip 该用哪个解释器：优先 Trade 的 venv，其次当前解释器。
+
+    返回 (解释器路径, 给用户看的提示或 None)。
+
+    为什么要这个：升级按钮必须在任何运行方式下都能用（可用性第一）。
+    老 README 教用户用系统 Python 跑 `python server.py`，这些机器上没有
+    Trade venv —— 原实现直接拒绝升级（not_in_trade_venv），用户只会看到
+    「更新失败」且毫无自助出路。现在改为：有 Trade venv 就把依赖装进
+    venv（不污染系统）；没有就用当前解释器继续升级，只提示、不中止。
+    """
+    venv_py = _trade_venv_python()
+    if venv_py is not None:
+        try:
+            same = venv_py.resolve() == Path(sys.executable).resolve()
+        except OSError:
+            same = False
+        if not same:
+            return str(venv_py), f"依赖将安装到 Trade 的虚拟环境：{venv_py}"
+        return sys.executable, None
+    if sys.prefix == sys.base_prefix:
+        return sys.executable, (
+            "当前不在虚拟环境内，依赖会装进系统 Python（升级继续，不会中止）"
+        )
+    return sys.executable, None
+
+
+def _pip_install_args(*args: str) -> list[str]:
+    return [_pip_python()[0], "-m", "pip", "install", "--no-user", *args]
+
+# ── 目录同步 ──────────────────────────────────────────────────────────────
+
+def _sync_dir_rsync(src: Path, dst: Path) -> None:
+    """递归同步目录 src → dst（覆盖旧文件，删除目标中多余文件）。
+
+    不跟踪软链接，不保留权限（统一 0o644/0o755）。
+    跳过 __pycache__、.DS_Store、.pyc 文件。
+    """
+    if not src.is_dir():
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+
+    _keep = set()  # 记录源目录的所有目标路径，用于后续清理
+    for item in src.rglob("*"):
+        # 跳过构建产物和系统文件
+        if item.name in ("__pycache__", ".DS_Store") or item.name.endswith(".pyc"):
+            continue
+        rel = item.relative_to(src)
+        target = dst / rel
+        _keep.add(str(target))
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # 只复制修改过的文件（mtime 比对，减少不必要的写盘）
+            if not target.is_file() or item.stat().st_mtime != target.stat().st_mtime:
+                shutil.copy2(item, target)
+
+    # 删除目标中多余的文件（源目录已移除的文件在目标中也应删除）
+    for item in sorted(dst.rglob("*"), reverse=True):
+        if item.name in ("__pycache__", ".DS_Store"):
+            continue
+        if str(item) not in _keep:
+            if item.is_dir() and not any(
+                str(c).startswith(str(item)) for c in _keep
+            ):
+                shutil.rmtree(item)
+            elif item.is_file():
+                item.unlink()
+
+
+def _sync_trade_template(template_src: Path, trade_home: Path) -> None:
+    """将 .trade-template/ 中新增的模板文件同步到 Trade 运行时目录。
+
+    仅复制新增的文件，不覆盖用户已有数据。
+    同时处理 prompts/system.md 的植入逻辑（与 install_skills 行为一致）。
+    """
+    if not template_src.is_dir():
+        return
+
+    _dest = trade_home / ".trade-template"
+    if not _dest.exists():
+        # 模板目录不存在：全量复制
+        shutil.copytree(template_src, _dest, dirs_exist_ok=False)
+        for f in _dest.rglob("*"):
+            if f.is_file() and os.name != "nt":
+                f.chmod(0o644)
+    else:
+        # 模板目录已存在：仅复制源目录中有但目标目录中缺少的文件
+        for item in template_src.rglob("*"):
+            rel = item.relative_to(template_src)
+            target = _dest / rel
+            if item.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif item.is_file() and not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, target)
+                if os.name != "nt":
+                    target.chmod(0o644)
+
+    # 植入初始 system prompt（仅当目标文件尚不存在时，不覆盖用户编辑的内容）
+    prompts_src = template_src / "prompts" / "system.md"
+    prompts_dir = trade_home / "prompts"
+    prompts_dst = prompts_dir / "system.md"
+    if prompts_src.is_file() and not prompts_dst.is_file():
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(prompts_src, prompts_dst)
+        if os.name != "nt":
+            prompts_dst.chmod(0o644)
+
+
+# ── 开机自启动 ────────────────────────────────────────────────────────────
+
+def _auto_start_present() -> bool:
+    """当前机器上是否已有 Trade 的开机自启项（用于更新时尊重用户的关闭决定）。
+
+    近似的存在性检查即可：更新只决定「要不要重新注册」，不需要精确状态。
+    任何异常都按"不存在"处理（宁可不碰自启配置）。
+    """
+    try:
+        if os.name == "nt":
+            from trade.post_install.win_setup import TASK_NAME
+
+            r = subprocess.run(
+                ["schtasks", "/query", "/tn", TASK_NAME],
+                capture_output=True, timeout=15,
+            )
+            return r.returncode == 0
+        if sys.platform == "darwin":
+            return (
+                Path.home() / "Library" / "LaunchAgents" / "com.trade.assistant.plist"
+            ).is_file()
+        if sys.platform == "linux":
+            return (Path.home() / ".config" / "systemd" / "user" / "trade.service").is_file()
+    except Exception:
+        pass
+    return False
+
+
+def _ensure_auto_start(trade_dir: Path) -> None:
+    """确保 Trade 在操作系统启动时自动运行（幂等操作：已存在则跳过）。
+
+    支持的平台：
+      - Windows: Task Scheduler 登录时触发
+      - macOS:   launchd plist 用户级守护进程
+      - Linux:   systemd user unit
+    """
+    if os.name == "nt":
+        _ensure_windows_auto_start(trade_dir)
+    elif sys.platform == "darwin":
+        _ensure_macos_auto_start(trade_dir)
+    elif sys.platform == "linux":
+        _ensure_linux_auto_start(trade_dir)
+
+
+def _ensure_windows_auto_start(trade_dir: Path) -> None:
+    """Windows: 开机自启（隐藏窗口）+ 桌面快捷方式。
+
+    委托给 `trade.post_install.win_setup` —— 那里是唯一实现，install.ps1 和
+    服务启动路径也调它。历史教训：这段逻辑曾有三份互相不一致的拷贝，其中两份
+    跑 python.exe（登录必弹终端窗口），只有文档里的手动教程是对的。
+    """
+    from trade.post_install.win_setup import ensure_windows_setup
+
+    for msg in ensure_windows_setup(trade_dir):
+        print(f"  {msg}")
+
+
+def _ensure_macos_auto_start(trade_dir: Path) -> None:
+    """macOS: 创建 launchd plist 用户级守护进程（Label: com.trade.assistant）。
+
+    plist 写入 ~/Library/LaunchAgents/，login 时自动加载。
+    """
+    plist_dir = Path.home() / "Library" / "LaunchAgents"
+    plist_file = plist_dir / "com.trade.assistant.plist"
+    if plist_file.is_file():
+        print("  ✓ 开机自启动任务已存在")
+        return
+
+    # trade 命令路径（优先 ~/.local/bin/trade，其次 PATH 中的 trade）
+    trade_bin = os.environ.get("HOME", str(Path.home())) + "/.local/bin/trade"
+    plist_content = textwrap.dedent(f"""\
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>com.trade.assistant</string>
+        <key>ProgramArguments</key>
+        <array>
+            <string>{trade_bin}</string>
+            <string>--no-browser</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>KeepAlive</key>
+        <true/>
+    </dict>
+    </plist>""")
+
+    plist_dir.mkdir(parents=True, exist_ok=True)
+    plist_file.write_text(plist_content, encoding="utf-8")
+    # bootstrap 加载到当前用户的 GUI session
+    subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_file)],
+        capture_output=True, timeout=30,
+    )
+    print("  ✓ 已设置开机自启动")
+
+
+def _ensure_linux_auto_start(trade_dir: Path) -> None:
+    """Linux: 创建 systemd user unit → daemon-reload → enable → start。"""
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_file = unit_dir / "trade.service"
+    if unit_file.is_file():
+        print("  ✓ 开机自启动任务已存在")
+        return
+
+    py_exe = sys.executable
+    server_py = str(trade_dir / "server.py")
+    unit_content = textwrap.dedent(f"""\
+    [Unit]
+    Description=路路通ai助手
+    After=network.target
+
+    [Service]
+    Type=simple
+    ExecStart={py_exe} {server_py} --no-browser
+    Restart=on-failure
+    RestartSec=10
+
+    [Install]
+    WantedBy=default.target
+    """)
+
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    unit_file.write_text(unit_content, encoding="utf-8")
+    subprocess.run(
+        ["systemctl", "--user", "daemon-reload"],
+        capture_output=True, timeout=30,
+    )
+    subprocess.run(
+        ["systemctl", "--user", "enable", "trade.service"],
+        capture_output=True, timeout=30,
+    )
+    subprocess.run(
+        ["systemctl", "--user", "start", "trade.service"],
+        capture_output=True, timeout=30,
+    )
+    print("  ✓ 已设置开机自启动")
+
+
+# ── Windows「正在运行的 exe 被占用」识别 ─────────────────────────────────
+
+def _looks_like_exe_lock(err: str) -> bool:
+    """判断 pip 失败是不是「正在运行的 exe 被占用」。
+
+    2026-10-30 Windows 客户机实测（铁证）：Trade 由 venv\\Scripts\\trade.exe
+    （pip 生成的 console script）启动，而升级第 4 步的 `pip install -e .` 要重写
+    同一个 trade.exe —— **Windows 不允许替换正在运行的 exe**（WinError 32）。
+    pip 的退路（先改名成 .deleteme）同样失败，于是 updater 判致命 → 回滚代码 →
+    界面只显示「升级失败」，而真实原因在界面上完全看不到。
+
+    判据要**同时**满足两个条件，避免误报：
+      1. 文本里有 Windows 的「占用」特征（WinError 32 / being used by another
+         process / 另一个程序正在使用此文件）；
+      2. 文本里提到了 .exe（pip 重写 console script 时会带上 'trade.exe.deleteme'）。
+    """
+    low = err.lower()
+    if ".exe" not in low:
+        return False
+    markers = (
+        "winerror 32",
+        "being used by another process",
+        "另一个程序正在使用此文件",
+        "resource temporarily unavailable",
+    )
+    return any(m in low for m in markers)
+
+
+def _install_trade_package(trade_dir: Path, emit, warnings: list[str]) -> str | None:
+    """editable 重装 Trade 自身（pip install -e . --no-deps）。
+
+    返回 None = 成功；返回字符串 = 致命错误（调用方要中止升级并回滚代码）。
+
+    「正在运行的 exe 被占用」在 Windows 上是升级按钮的经典死结：
+    pip 要重写的 trade.exe 正被本服务占着（WinError 32）。但它**不是致命错误**：
+    Trade 是 editable 安装，代码已由 Step 1 的 git pull 更新到位，版本号读的是
+    源码里的 pyproject.toml（trade/app.py:_pyproject_path），跟 pip 重装无关。
+    跳过的只是 console script 的重写 —— 而我们正在把启动方式从 trade.exe 迁到
+    python.exe + server.py（见 win_setup.resolve_trade_command）。所以这里降级为
+    警告，**升级照常算成功**（可用性高于一切）。
+    """
+    result = subprocess.run(
+        _pip_install_args("-e", str(trade_dir), "--no-deps"),
+        capture_output=True, text=True, timeout=600, env=_pip_env(),
+    )
+    if result.returncode == 0:
+        emit("  ✓ Package updated")
+        return None
+    err = result.stderr.strip()
+    if _looks_like_exe_lock(err):
+        hint = _exe_lock_hint(trade_dir)
+        emit("  ⚠ pip install -e . 因文件被占用而跳过（不影响本次升级生效）")
+        emit(f"  💡 {hint}")
+        warnings.append(hint)
+        return None
+    emit(f"  ❌ pip install failed: {err}")
+    return err
+
+
+def _exe_lock_hint(trade_dir: Path) -> str:
+    """给出「占用」场景下用户**能照做**的下一步（而不是一句「升级失败」）。
+
+    这次升级**不会因此失败**（editable 安装下代码已通过 git pull 生效，
+    版本号读的是源码里的 pyproject.toml）——跳过的只是 console script 的重写。
+    根治办法是让 Trade 不再由 trade.exe 启动：开机自启与桌面快捷方式在本次升级
+    里已改成 `python.exe + server.py`，**重启一次**即可生效。
+    """
+    py = Path(sys.executable)
+    server_py = trade_dir / "server.py"
+    return (
+        "Trade 正由 trade.exe 启动，Windows 不允许替换正在运行的可执行文件，"
+        "所以本次升级跳过了「重写 console script」这一步（不影响代码与版本号生效）。"
+        "请**重启一次 Trade** —— 重启后开机自启与桌面快捷方式会改用 "
+        f'"{py}" "{server_py}" 启动，之后升级就不会再撞这个问题。'
+    )
+
+
+# ── 可选依赖（best-effort）───────────────────────────────────────────────
+
+# 客户语义检索默认关闭（opt-in），升级链路不再默认安装 sqlite-vec。
+# 需要时用户显式开启：pip install sqlite-vec + TRADE_SEMANTIC=on
+# （见 docs/EXEMPTIONS.md）。保留空元组是为了让 _install_optional_deps
+# 的结构不变，未来有真正默认安装的可选依赖时直接加回来。
+#
+# 每项是 (import 名, pip 规格, 展示名, 超时秒数)。
+_OPTIONAL_DEPS = ()
+
+
+def _install_optional_deps(emit, warnings: list[str]) -> None:
+    """装可选依赖；已装则跳过，任何失败只记警告，绝不阻断升级。
+
+    emit 由调用方传入（update_trade() 里的闭包，同时 print + 记 messages）——
+    本函数是模块级的，拿不到那个闭包。
+    """
+    for module_name, spec, label, timeout in _OPTIONAL_DEPS:
+        # 已装就跳过（不重复下载）
+        if importlib.util.find_spec(module_name) is not None:
+            continue
+        emit(f"→ Step 4b: 可选依赖（{label}）...")
+        try:
+            result = subprocess.run(
+                _pip_install_args(spec),
+                capture_output=True, text=True, timeout=timeout, env=_pip_env(),
+            )
+        except Exception as e:  # 超时/环境异常都不该拖垮升级
+            emit(f"  ⚠ {label} 安装跳过：{e}")
+            warnings.append(f"optional dep {label} skipped: {e}")
+            continue
+        if result.returncode == 0:
+            emit(f"  ✓ {label} 已安装")
+        else:
+            emit(f"  ⚠ {label} 安装失败：相关能力自动降级（其余功能不受影响）")
+            warnings.append(f"optional dep {label} failed to install")
+
+
+# ── 一键更新主函数 ────────────────────────────────────────────────────────
+
+def _interpreter_note() -> str | None:
+    """升级环境提示（**不中止升级**）：pip 会装到哪、可能有什么后果。
+
+    2026-10-29：原 `_refuse_reason_for_interpreter()` 会直接中止升级
+    （`not_in_trade_venv`）—— 老 README 教用户用系统 Python 跑 Trade，这些
+    机器永远升不了级，用户只看到「更新失败」。可用性第一：改为提示 + 继续，
+    pip 解释器由 `_pip_python()` 选择（有 Trade venv 就装进 venv）。
+    """
+    _, hint = _pip_python()
+    return hint
+
+
+def _git_head(trade_dir: Path) -> str | None:
+    """读取检出当前的 HEAD sha；目录不存在 / 非 git 仓库 / 无 git 时返回 None。"""
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(trade_dir), capture_output=True, text=True, timeout=30,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    sha = r.stdout.strip()
+    return sha if r.returncode == 0 and len(sha) >= 7 else None
+
+
+#: git 子进程的固定环境：禁止任何交互提示。
+#: 私有仓库/凭证过期时，`git` 会在后台服务里静等账号密码，界面永远停在"更新中"。
+_GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+
+
+def _explain_git_error(stderr: str, stdout: str = "") -> str:
+    """把 git 的报错翻成**能照做**的中文提示（而不是笼统的「检查网络」）。
+
+    2026-11-02 客户机实测：界面只显示「无法解析远端 main 的最新提交，请检查网络
+    或代理后重试」，但真实原因可能是 git 没走代理、credential 过期、origin 配置
+    丢了 —— 三种情况的解法完全不同，笼统提示等于没有提示。
+    """
+    text = (stderr or stdout or "").strip()
+    low = text.lower()
+
+    if "could not resolve host" in low or "failed to connect" in low or \
+            "connection timed out" in low or "network is unreachable" in low or \
+            "connection refused" in low or "unable to access" in low:
+        return (
+            "连不上 GitHub（" + _first_line(text) + "）。"
+            "若浏览器能打开 GitHub，说明 git 没走代理："
+            "git config --global http.proxy http://127.0.0.1:<代理端口>"
+        )
+    if "authentication failed" in low or "could not read username" in low or \
+            "permission denied" in low or "invalid username or password" in low:
+        return "GitHub 认证失败（凭证过期或无权限）：到 Git 凭据管理器里删除旧凭据后重试。"
+    if "does not appear to be a git repository" in low or "no such remote" in low or \
+            "not a git repository" in low:
+        return (
+            "安装目录的 git 配置异常（origin 不存在或指向错误）："
+            "在安装目录执行 git remote -v 检查。"
+        )
+    return f"git 读取远端失败：{_first_line(text)}"
+
+
+def _first_line(text: str) -> str:
+    """取报错里第一行有效内容（UI 上只放得下一行）。"""
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()[:160]
+    return "无输出"
+
+
+def _remote_main_sha_diagnose(remote: str, cwd: Path) -> tuple[str | None, str]:
+    """解析远端 main 的 SHA；返回 (sha, 失败原因)。
+
+    sha 为 None 时，第二个值是给用户看的可读原因（调用方直接展示）。
+    """
+    try:
+        r = subprocess.run(
+            ["git", "ls-remote", remote, "refs/heads/main"],
+            cwd=str(cwd), capture_output=True, text=True, timeout=60,
+            env={**os.environ, **_GIT_ENV},
+        )
+    except FileNotFoundError:
+        return None, "未找到 git 命令 —— 请先安装 Git（winget install Git.Git）后重开 Trade。"
+    except subprocess.TimeoutExpired:
+        return None, (
+            "读取远端超时（60 秒）。网络能连但太慢时可能是 git 没走代理："
+            "git config --global http.proxy http://127.0.0.1:<代理端口>"
+        )
+    except OSError as e:
+        return None, f"无法运行 git：{e}"
+    except subprocess.SubprocessError as e:
+        return None, f"git 执行失败：{e}"
+
+    if r.returncode != 0:
+        return None, _explain_git_error(r.stderr, r.stdout)
+
+    parts = r.stdout.split()
+    sha = parts[0].strip().lower() if parts else ""
+    if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
+        return None, "远端返回的提交号无效（可能是仓库地址指向了非 git 页面）。"
+    return sha, ""
+
+
+def _remote_main_sha_from(remote: str, cwd: Path) -> str | None:
+    """解析 `remote` 的 main 分支当前提交 SHA；解析失败返回 None。"""
+    sha, _reason = _remote_main_sha_diagnose(remote, cwd)
+    return sha
+
+
+def _remote_main_sha(trade_dir: Path) -> str | None:
+    """解析 origin/main 当前的提交 SHA，用于把本次更新钉死在这个提交上。
+
+    为什么先查远端：`git pull origin main` 拉的是"命令执行那一刻"的分支头，
+    若拉取过程中远端被推了新提交，装进来的就未必是用户点更新时那个版本。
+    先记下 SHA、拉取后再回读 HEAD 比对，不一致就中止 —— 宁可让用户重试，
+    也不要把一个未经确认的提交装进本机。
+    """
+    return _remote_main_sha_from("origin", trade_dir)
+
+
+def _remote_main_sha_ex(trade_dir: Path) -> tuple[str | None, str]:
+    """同 `_remote_main_sha`，但失败时返回可读原因（用于界面提示）。"""
+    return _remote_main_sha_diagnose("origin", trade_dir)
+
+
+def _normalize_sha(value: str | None) -> str | None:
+    """接受 40 位十六进制提交 SHA；非法返回 None（防参数注入）。"""
+    if not isinstance(value, str):
+        return None
+    sha = value.strip().lower()
+    if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
+        return None
+    return sha
+
+
+def preview_update_target() -> dict:
+    """前端确认框用：返回本次更新将要钉选的远端 main 短 SHA。"""
+    trade_dir = _get_trade_home() / "foreign-trade-assistant"
+    if not trade_dir.is_dir():
+        return {"ok": False, "error": "安装目录不存在，无法检查更新目标。"}
+    sha, reason = _remote_main_sha_ex(trade_dir)
+    if not sha:
+        return {"ok": False, "error": f"无法解析远端 main 的最新提交：{reason}"}
+    return {"ok": True, "sha": sha, "short": sha[:8]}
+
+
+def _pending_update_path() -> Path:
+    return _get_trade_home() / "data" / "pending_update.json"
+
+
+def _record_pending_update(
+    pre_update_sha: str | None, target_sha: str | None, version: str,
+) -> None:
+    """记下"已更新、待重启"的现场，供重启 watchdog 回退使用。
+
+    只有真正换了代码（有旧提交 + 目标提交）才写；首次安装没有可回退点。
+    """
+    if not pre_update_sha or not target_sha:
+        return
+    try:
+        path = _pending_update_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "pre_update_sha": pre_update_sha,
+                    "target_sha": target_sha,
+                    "version": version,
+                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as e:
+        print(f"  ⚠ 无法记录待重启更新现场（{e}）；重启将跳过自动回退。", file=sys.stderr)
+
+
+def _verify_pinned_head(
+    trade_dir: Path, target_sha: str, emit, errors: list[str],
+) -> bool:
+    """回读 HEAD，确认它正是本次钉选的提交；不一致记错误并返回 False。"""
+    got = _git_head(trade_dir)
+    if got == target_sha:
+        emit(f"  ✓ 已停在钉选提交 {target_sha[:8]}")
+        return True
+    got_short = (got or "unknown")[:8]
+    emit(f"  ❌ HEAD 与钉选提交不一致：期望 {target_sha[:8]}，实际 {got_short}")
+    errors.append(f"pinned head mismatch: expected {target_sha[:8]}, got {got_short}")
+    return False
+
+
+def _prune_failed_migration_copies(backups_dir: Path, keep: int = 3) -> None:
+    """只保留最近 `keep` 份 `*-failed-migration.db` 现场副本。
+
+    每次迁移失败都会另存一份；不清理会无限累积（审计 P1-10 残留）。
+    清理失败只忽略 —— 留盘比中断恢复安全。
+    """
+    try:
+        olds = sorted(
+            backups_dir.glob("trade-*-failed-migration.db"), reverse=True,
+        )
+        for stale in olds[keep:]:
+            stale.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _restore_db_after_failed_migration(
+    backup_path: Path, db_path: Path, emit, warnings: list[str],
+) -> bool:
+    """数据库迁移失败后，把库恢复到升级前的快照。
+
+    为什么不能只回滚代码：Step 7 的迁移可能已经改了表结构（ALTER TABLE 不可逆），
+    旧代码面对半迁移的库仍可能起不来。升级前那份备份本来就是为了这一刻。
+
+    恢复前先把"迁移失败后的库"另存一份（`*-failed-migration.db`）—— 它可能已经是
+    半迁移状态，但仍是排查迁移 bug 的唯一现场，不能直接覆盖掉。
+    """
+    import sqlite3
+
+    if backup_path is None or not backup_path.is_file():
+        warnings.append("no pre-upgrade db backup to restore")
+        return False
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    failed_copy = backup_path.parent / f"trade-{stamp}-failed-migration.db"
+    try:
+        from trade.post_install.backup import snapshot_db
+
+        snapshot_db(db_path, failed_copy)
+        emit(f"  ℹ️ 迁移失败的库已另存：{failed_copy.name}")
+        _prune_failed_migration_copies(backup_path.parent)
+    except Exception as e:
+        # 现场拷贝失败不阻断恢复：备份本身还在
+        warnings.append(f"failed-migration snapshot skipped: {e}")
+
+    try:
+        # 用 SQLite 在线备份 API 写回，而不是 shutil.copy2：服务仍在运行，
+        # 直接覆盖文件会与 WAL / 活跃连接打架。
+        src = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
+        try:
+            dst = sqlite3.connect(str(db_path), timeout=30)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+    except Exception as e:
+        emit(f"  ❌ 恢复数据库备份失败：{e}")
+        emit(f"  💡 请手动用备份覆盖数据库：{backup_path}")
+        warnings.append(f"db restore after failed migration failed: {e}")
+        return False
+
+    emit(f"  ↩ 数据库已恢复到升级前备份（{backup_path.name}）")
+    return True
+
+
+def _rollback_checkout(
+    trade_dir: Path, target_sha: str, emit, warnings: list[str],
+) -> bool:
+    """把检出回退到升级前的提交，返回是否成功。
+
+    为什么必须回滚：git pull 成功后，后面任何一步致命失败（pip 装不上、数据库
+    迁移失败）都会留下「源码已是新版、依赖还是旧版」的半升级状态 —— 服务不重启，
+    但下次重启就会用新代码配旧依赖启动，直接起不来（2026-10-21 审计 P0）。
+    回到旧源码，至少让失败升级保持「可继续用旧版本运行」。
+
+    为什么用 `reset --keep` 而不是 `--hard`：`--keep` 保留用户在运行目录里的
+    未提交改动，且当回退会覆盖这些改动时**直接中止** —— `--hard` 会静默删掉
+    用户的工作，比半升级更难挽回。
+    """
+    try:
+        r = subprocess.run(
+            ["git", "reset", "--keep", target_sha],
+            cwd=str(trade_dir), capture_output=True, text=True, timeout=120,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError) as e:
+        msg = f"rollback to {target_sha[:8]} failed: {e}"
+        emit(f"  ❌ 回退失败：{e}")
+        warnings.append(msg)
+        return False
+
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout).strip()
+        msg = f"rollback to {target_sha[:8]} failed: {detail[:200]}"
+        emit(f"  ❌ 回退失败（可能有未提交改动与之冲突）：{detail[:200]}")
+        emit(f"  💡 手动恢复：cd {trade_dir} && git reset --keep {target_sha}")
+        warnings.append(msg)
+        return False
+
+    # 退出码不等于回退成功：`git reset --keep` 在遇到冲突的未提交改动时
+    # **静默放弃、既不改工作树也不报错，退出码仍是 0**（2026-10-21 真机实测）。
+    # 只信退出码会把"没回退"误报成"已回退" —— 用户以为回到了旧版本，
+    # 实际代码还停在新版。唯一可靠的判据是回读 HEAD。
+    now_head = _git_head(trade_dir)
+    if now_head is None or not now_head.startswith(target_sha[:8]):
+        msg = f"rollback to {target_sha[:8]} did not take effect (HEAD={now_head})"
+        emit("  ❌ 回退未生效（工作区有与回退冲突的未提交改动，git 已放弃回退）")
+        emit(f"  💡 手动恢复：cd {trade_dir} && git stash && git reset --keep {target_sha}")
+        warnings.append(msg)
+        return False
+
+    emit(f"  ↩ 已回退代码到升级前版本（{target_sha[:8]}），继续用旧版本运行。")
+    # Step 2/3 已把新代码的技能复制进 ~/.hermes/skills —— 回退代码后重新同步一次，
+    # 保持「代码版本 ↔ 技能版本」自洽；失败只是多一条警告，不掩盖回滚本身成功。
+    try:
+        install_skills()
+    except (SystemExit, Exception) as e:
+        warnings.append(f"skills resync after rollback failed: {e}")
+    return True
+
+
+def update_trade(target_sha_request: str | None = None) -> dict:
+    """一键更新 路路通ai助手 系统。
+
+    `target_sha_request`：前端预览接口返回、用户确认过的目标提交。
+    提供时更新钉在**这一个**提交上（不再临场重取 main），保证"确认框显示的
+    SHA = 实际安装的 SHA"。
+
+    返回结构化结果: {"ok": bool, "version": str, "target_sha": str,
+                     "errors": list[str], "messages": list[str]}
+
+    7 步更新流程（全部在 ~/.trade/foreign-trade-assistant/ 中执行，不依赖开发目录）：
+      1. git pull / git clone
+      2. install_skills()
+      3. update_skills()
+      4. pip install -e .
+      5. template sync
+      6. auto-start check
+      7. database migration
+    """
+    trade_home = _get_trade_home()
+    trade_dir = trade_home / "foreign-trade-assistant"
+    # errors = 致命失败（git / pip / 数据库），必须阻止重启
+    # warnings = 非致命失败（skills / 模板 / 开机自启），记录并上报但继续重启
+    errors: list[str] = []
+    warnings: list[str] = []
+    messages: list[str] = []
+    new_version = ""
+    pre_update_db_backup: Path | None = None
+
+    # 前端确认过的目标提交（可选）。非法值直接拒绝，不进入任何 git 操作。
+    requested_sha = _normalize_sha(target_sha_request) if target_sha_request else None
+    if target_sha_request and not requested_sha:
+        return {
+            "ok": False, "version": "", "target_sha": "",
+            "error": "目标提交 SHA 格式非法（需要 40 位十六进制）。",
+            "errors": ["invalid target_sha"], "warnings": [], "messages": [],
+        }
+
+    def _emit(msg: str) -> None:
+        """同时 print 和记录到 messages（保持 CLI 和 API 兼容）。"""
+        print(msg)
+        messages.append(msg)
+
+    # ── Step 0: 架构检测 ─────────────────────────────────────────────────
+    from trade.bootstrap import check_native_architecture
+    if not check_native_architecture():
+        _emit("  ✗ 升级已中止：架构不匹配，继续升级会导致 Hermes 不可用。")
+        return {
+            "ok": False,
+            "version": "",
+            "errors": ["architecture_mismatch"],
+            "warnings": warnings,
+            "messages": messages,
+        }
+
+    # ── Step 0b: 解释器提示（只提示，不中止）───────────────────────────────
+    # 可用性第一：无论用户是 venv 还是系统 Python 跑的 Trade，升级都必须能进行。
+    _note = _interpreter_note()
+    if _note:
+        _emit(f"  ℹ️ {_note}")
+        warnings.append(_note)
+
+    # ── Step 0c: 升级前数据库备份 ──────────────────────────────────────────
+    # 为什么必须在 Step 1 之前：数据库迁移不可逆，一旦迁移失败或新版本行为有变，
+    # 没有开工前的快照就无法回到"能跑"的状态。备份失败必须**中止升级** ——
+    # 在没有可回退备份的情况下换代码 + 迁移 schema，比"升级失败"严重得多。
+    try:
+        from trade.post_install.backup import backup_db_before_upgrade
+
+        pre_update_db_backup = backup_db_before_upgrade(
+            trade_home / "data" / "trade.db",
+            trade_home / "backups",
+        )
+        if pre_update_db_backup:
+            _emit(f"  ✓ 升级前数据库备份：{pre_update_db_backup.name}")
+        else:
+            _emit("  ℹ️ 尚无数据库（首次安装），跳过备份")
+    except Exception as e:
+        _emit(f"  ❌ 升级前备份失败，已中止升级：{e}")
+        errors.append(f"pre-upgrade backup failed: {e}")
+        return {
+            "ok": False, "version": "", "error": f"升级前备份失败：{e}",
+            "errors": errors, "warnings": warnings, "messages": messages,
+        }
+
+    # 升级前的提交：Step 1 之后任何致命失败都要回退到这里（见 _rollback_checkout）。
+    # clone 场景没有旧提交 —— 目录本身不存在，失败时无事可回退。
+    pre_update_sha = _git_head(trade_dir) if trade_dir.is_dir() else None
+
+    def _rollback_if_possible(reason: str) -> None:
+        """致命失败后回退源码（有旧提交时）；回滚失败只记警告，不掩盖原始错误。"""
+        if not pre_update_sha:
+            return
+        if _rollback_checkout(trade_dir, pre_update_sha, _emit, warnings):
+            warnings.append(f"checkout rolled back after {reason}")
+
+    # ── Step 1: git pull / clone ───────────────────────────────────────────
+    # 本次更新钉选的提交（clone 也在 clone 后 checkout 到同一个 SHA）
+    target_sha: str | None = None
+    _REPO_URL = "https://github.com/chefroger/smart%2Dtrade%2Dai.git"
+    if not trade_dir.is_dir():
+        _emit("→ Step 1/7: git clone (install directory not found) ...")
+        _emit(f"  Target: {trade_dir}")
+        trade_dir.parent.mkdir(parents=True, exist_ok=True)
+        # 首次安装同样钉选：clone 拿到的是 clone 那一刻的分支头，先记下 SHA
+        target_sha, why = _remote_main_sha_diagnose(_REPO_URL, trade_dir.parent)
+        if not target_sha:
+            _emit(f"  ❌ 无法解析远端 main 的最新提交：{why}，已中止安装。")
+            errors.append(f"cannot resolve remote main commit: {why}")
+            return {
+                "ok": False, "version": "",
+                "error": f"无法解析远端 main 的最新提交：{why}",
+                "errors": errors, "warnings": warnings, "messages": messages,
+            }
+        _emit(f"  ℹ️ 本次安装钉选提交：{target_sha[:8]}")
+        try:
+            clone_result = subprocess.run(
+                ["git", "clone", _REPO_URL, str(trade_dir)],
+                capture_output=True, text=True, timeout=300,
+            )
+        except FileNotFoundError:
+            _emit("  ❌ git 命令未找到，请先安装 Git for Windows 并重启终端")
+            errors.append("git not found")
+            return {"ok": False, "version": "", "error": "Git 未安装或不在 PATH 中，请先安装 Git for Windows", "errors": errors, "warnings": warnings, "messages": messages}
+        if clone_result.returncode != 0:
+            err = clone_result.stderr.strip()
+            _emit(f"  ❌ git clone failed: {err}")
+            errors.append(f"git clone failed: {err}")
+            return {"ok": False, "version": "", "error": err, "errors": errors, "warnings": warnings, "messages": messages}
+        # 把本地 main 指到钉选提交（clone 期间远端可能被推进）；之后回读校验
+        pinned = subprocess.run(
+            ["git", "checkout", "-B", "main", target_sha],
+            cwd=str(trade_dir), capture_output=True, text=True, timeout=120,
+        )
+        if pinned.returncode != 0:
+            err = (pinned.stderr or pinned.stdout).strip()
+            _emit(f"  ❌ 无法检出钉选提交 {target_sha[:8]}：{err[:200]}")
+            errors.append(f"checkout pinned clone failed: {err[:200]}")
+            _emit("  💡 已删除不完整的安装目录，请重试。")
+            shutil.rmtree(trade_dir, ignore_errors=True)
+            return {"ok": False, "version": "", "error": err[:200], "errors": errors, "warnings": warnings, "messages": messages}
+        if not _verify_pinned_head(trade_dir, target_sha, _emit, errors):
+            shutil.rmtree(trade_dir, ignore_errors=True)
+            return {
+                "ok": False, "version": "",
+                "error": f"clone 后 HEAD 与钉选提交不一致（期望 {target_sha[:8]}），已删除不完整目录。",
+                "errors": errors, "warnings": warnings, "messages": messages,
+            }
+        _emit(f"  ✓ Repository cloned to {trade_dir}")
+    else:
+        _emit("→ Step 1/7: git pull ...")
+        # 目标提交：前端确认过就用它（显示即所用）；否则临场取 main 当前头。
+        if requested_sha:
+            target_sha = requested_sha
+            _emit(f"  ℹ️ 本次更新钉选提交（用户确认）：{target_sha[:8]}")
+        else:
+            target_sha, why = _remote_main_sha_ex(trade_dir)
+            if not target_sha:
+                _emit(f"  ❌ 无法解析远端 main 的最新提交：{why}，已中止升级。")
+                errors.append(f"cannot resolve remote main commit: {why}")
+                return {
+                    "ok": False, "version": "",
+                    "error": f"无法解析远端 main 的最新提交：{why}",
+                    "errors": errors, "warnings": warnings, "messages": messages,
+                }
+            _emit(f"  ℹ️ 本次更新钉选提交：{target_sha[:8]}")
+        try:
+            result = subprocess.run(
+                ["git", "pull", "--ff-only", "origin", "main"],
+                cwd=str(trade_dir), capture_output=True, text=True, timeout=120,
+            )
+        except FileNotFoundError:
+            _emit("  ❌ git 命令未找到，请先安装 Git for Windows 并重启终端")
+            errors.append("git not found")
+            return {"ok": False, "version": "", "error": "Git 未安装或不在 PATH 中，请先安装 Git for Windows", "errors": errors, "warnings": warnings, "messages": messages}
+        if result.returncode != 0:
+            err_text = result.stderr.strip()
+            _emit(f"  ⚠ git pull failed: {err_text}")
+            _emit("  💡 尝试自动 stash 后重试...")
+            stash = subprocess.run(
+                ["git", "stash"], cwd=str(trade_dir),
+                capture_output=True, text=True, timeout=30,
+            )
+            if stash.returncode == 0:
+                pull2 = subprocess.run(
+                    ["git", "pull", "--ff-only", "origin", "main"],
+                    cwd=str(trade_dir), capture_output=True, text=True, timeout=120,
+                )
+                if pull2.returncode == 0:
+                    _emit("  ✓ git pull (after stash) OK")
+                    pop = subprocess.run(
+                        ["git", "stash", "pop"], cwd=str(trade_dir),
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    # stash pop 冲突：index 进入 unmerged 状态，后续 reset --keep 必然
+                    # fatal。必须立即中止，并把代码恢复到升级前（改动仍在 stash 里，
+                    # 用户手动 pop 可取回），不能让仓库停在「冲突 + 新代码」的混合态。
+                    if pop.returncode != 0:
+                        _emit(f"  ⚠ git stash pop 冲突：{pop.stderr.strip()}")
+                        if pre_update_sha:
+                            hard = subprocess.run(
+                                ["git", "reset", "--hard", pre_update_sha],
+                                cwd=str(trade_dir), capture_output=True,
+                                text=True, timeout=120,
+                            )
+                            if hard.returncode == 0:
+                                _emit(f"  ↩ 已恢复到升级前代码（{pre_update_sha[:8]}）")
+                            else:
+                                _emit(
+                                    "  ⚠ 自动恢复失败，请手动执行："
+                                    f"cd {trade_dir} && git reset --hard {pre_update_sha}"
+                                )
+                        else:
+                            # 没有可回退点（读不到 HEAD）：仓库可能停在 UU 冲突态
+                            _emit(
+                                "  ⚠ 没有升级前的提交可回退，仓库可能停在冲突状态；"
+                                f"请先 cd {trade_dir} && git status 查看后再处理。"
+                            )
+                        _emit("  ⚠ 你的本地改动仍在 git stash 中（未丢失）")
+                        _emit(
+                            f"  💡 恢复方式：cd {trade_dir} && git status && git stash pop"
+                        )
+                        errors.append("git stash pop conflicted; update aborted")
+                        warnings.append("local changes remain stashed (git stash pop conflicted)")
+                        return {
+                            "ok": False, "version": "",
+                            "error": "本地改动与升级内容冲突，升级已中止；改动仍在 git stash 中。",
+                            "errors": errors, "warnings": warnings, "messages": messages,
+                        }
+                else:
+                    err2 = pull2.stderr.strip()
+                    _emit(f"  ❌ git pull failed after stash: {err2}")
+                    # 关键：本地改动已被 stash 且未 pop，工作区看起来「改动消失了」——
+                    # 必须明确告知用户改动在哪、怎么取回，不能静默吞掉
+                    _emit("  ⚠ 你的本地改动已被暂存到 git stash（未自动恢复）")
+                    _emit(f"  💡 恢复方式：cd {trade_dir} && git stash pop")
+                    errors.append(f"git pull failed: {err2}")
+                    warnings.append("local changes were stashed and not restored (run: git stash pop)")
+                    return {"ok": False, "version": "", "error": err2, "errors": errors,
+                            "warnings": warnings, "messages": messages}
+            else:
+                err_s = stash.stderr.strip()
+                _emit(f"  ❌ git stash also failed: {err_s}")
+                errors.append(f"git stash failed: {err_s}")
+                return {"ok": False, "version": "", "error": err_s, "errors": errors, "warnings": warnings, "messages": messages}
+        else:
+            last_line = result.stdout.strip().split("\n")[-1] if result.stdout.strip() else "Already up-to-date."
+            _emit(f"  ✓ {last_line}")
+
+        # 用户确认过的固定提交：拉取后钉回该提交（拉取期间远端可能已前进）。
+        if requested_sha:
+            anc = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", target_sha, "FETCH_HEAD"],
+                cwd=str(trade_dir), capture_output=True, text=True, timeout=60,
+            )
+            if anc.returncode != 0:
+                _rollback_if_possible("target sha not on main")
+                _emit(f"  ❌ 目标提交 {target_sha[:8]} 不在远端 main 上，已中止。")
+                errors.append("target sha not on main")
+                return {
+                    "ok": False, "version": "", "target_sha": target_sha,
+                    "error": "目标提交不在 main 分支上，请重新检查更新后重试。",
+                    "errors": errors, "warnings": warnings, "messages": messages,
+                }
+            pin = subprocess.run(
+                ["git", "reset", "--keep", target_sha],
+                cwd=str(trade_dir), capture_output=True, text=True, timeout=120,
+            )
+            if pin.returncode != 0:
+                detail = (pin.stderr or pin.stdout).strip()[:200]
+                _rollback_if_possible("cannot pin requested sha")
+                _emit(f"  ❌ 无法钉到确认的提交 {target_sha[:8]}：{detail}")
+                errors.append(f"cannot pin requested sha: {detail}")
+                return {
+                    "ok": False, "version": "", "target_sha": target_sha,
+                    "error": f"无法切换到确认的版本：{detail}",
+                    "errors": errors, "warnings": warnings, "messages": messages,
+                }
+            _emit(f"  ✓ 已钉到确认的提交 {target_sha[:8]}")
+
+        # 回读 HEAD：只认钉选的那个提交。不一致说明拉取过程中远端被推进
+        # （或工作区有异常），此时装进来的不是用户确认过的版本 —— 回退并中止。
+        if not _verify_pinned_head(trade_dir, target_sha, _emit, errors):
+            _rollback_if_possible("remote main moved during update")
+            return {
+                "ok": False, "version": "",
+                "error": f"更新期间远端 main 发生变化（期望 {target_sha[:8]}），请重试。",
+                "errors": errors, "warnings": warnings, "messages": messages,
+            }
+
+    # ── 读取更新后的版本号并写入 version.txt ─────────────────────────────
+    try:
+        import tomllib as _toml_v
+    except ImportError:
+        import tomli as _toml_v
+    try:
+        pyproject = trade_dir / "pyproject.toml"
+        # 显式 utf-8：Windows 默认 cp1252，pyproject.toml 含中文注释会读失败
+        data = _toml_v.loads(pyproject.read_text(encoding="utf-8"))
+        new_version = data.get("project", {}).get("version", "")
+        _emit(f"  ℹ️  Target version: v{new_version}")
+    except Exception:
+        pass
+
+    # ── Step 2: install_skills ────────────────────────────────────────────
+    # skills 同步有离线兜底，失败只记警告：代码与依赖都已就绪，
+    # 若把它算作致命失败就会把用户锁在旧代码上，得不偿失
+    _emit("→ Step 2/7: install skills ...")
+    try:
+        install_skills()
+        _emit("  ✓ Skills installed")
+    # 必须同时捕 SystemExit 与 Exception（两者**没有**继承关系）：
+    #   - SystemExit：install_skills 内部会 sys.exit()
+    #   - Exception：文件复制（shutil.copy2/copytree）遇到目录只读、磁盘满、
+    #     杀软占用时会抛 OSError/PermissionError
+    # 只捕前者会让后者穿透，而这一步被明确定义为「非致命」。穿透的后果是
+    # 半升级状态：代码已 git pull 到新版、依赖没装、服务不重启、UI 只有一个 500。
+    except (SystemExit, Exception) as e:
+        msg = f"install_skills failed: {e}"
+        _emit(f"  ⚠ {msg}（非致命，继续升级）")
+        warnings.append(msg)
+
+    # ── Step 3: update_skills ─────────────────────────────────────────────
+    _emit("→ Step 3/7: update skills ...")
+    try:
+        update_skills()
+        _emit("  ✓ Skills updated")
+    except (SystemExit, Exception) as e:  # 理由同上：这一步同样是非致命
+        msg = f"update_skills failed: {e}"
+        _emit(f"  ⚠ {msg}（非致命，继续升级）")
+        warnings.append(msg)
+
+    # ── Step 4: pip install ───────────────────────────────────────────────
+    # 与 install.sh Step 3 保持一致：先按 requirements.txt 装依赖，再用
+    # --no-deps 装 Trade 自身。不能不带 --no-deps——Hermes 的 setup.py 已
+    # 明确拒绝通过 pip 构建（直接抛 RuntimeError），它由安装脚本单独
+    # editable 安装；让 pip 去解析这个依赖会让整次升级失败。
+    _emit("→ Step 4/7: pip install ...")
+    req_file = trade_dir / "requirements.txt"
+    if req_file.is_file():
+        result = subprocess.run(
+            _pip_install_args("-r", str(req_file)),
+            capture_output=True, text=True, timeout=600, env=_pip_env(),
+        )
+        if result.returncode != 0:
+            err = result.stderr.strip()
+            _emit(f"  ❌ 依赖安装失败: {err}")
+            errors.append(f"pip install -r requirements.txt failed: {err[:200]}")
+            _rollback_if_possible("pip install -r requirements.txt failed")
+            return {"ok": False, "version": "", "error": err[:200], "errors": errors, "warnings": warnings, "messages": messages}
+    pkg_err = _install_trade_package(trade_dir, _emit, warnings)
+    if pkg_err is not None:
+        errors.append(f"pip install failed: {pkg_err[:200]}")
+        _rollback_if_possible("pip install -e . failed")
+        return {"ok": False, "version": "", "error": pkg_err[:200], "errors": errors, "warnings": warnings, "messages": messages}
+
+    # ── Step 4b: 可选依赖（best-effort，失败只警告）────────────────────────
+    _install_optional_deps(_emit, warnings)
+
+    # ── Step 5: template sync ─────────────────────────────────────────────
+    _emit("→ Step 5/7: template sync ...")
+    try:
+        template_src = trade_dir / ".trade-template"
+        trade_home = _get_trade_home()
+        trade_home.mkdir(parents=True, exist_ok=True)
+        _sync_trade_template(template_src, trade_home)
+        _emit("  ✓ Templates synced")
+    except Exception as e:
+        _emit(f"  ⚠ Template sync failed: {e}")
+        warnings.append(f"template sync failed: {e}")
+
+    # ── Step 6: auto-start ────────────────────────────────────────────────
+    # 尊重用户的关闭决定：已有自启项才重新注册；用户手动关掉的，更新不能
+    # 又替他打开（审计 P2-20）。首次安装（clone，pre_update_sha=None）照常注册。
+    _emit("→ Step 6/7: auto-start check ...")
+    try:
+        if pre_update_sha is None or _auto_start_present():
+            _ensure_auto_start(trade_dir)
+            _emit("  ✓ Auto-start OK")
+        else:
+            _emit("  ℹ️ 开机自启已被你关闭，更新不会重新打开（如需启用请手动设置）")
+    except Exception as e:
+        _emit(f"  ⚠ Auto-start setup failed: {e}")
+        warnings.append(f"auto-start setup failed: {e}")
+
+    # ── Step 7: database ──────────────────────────────────────────────────
+    _emit("→ Step 7/7: database check ...")
+    try:
+        from trade.database import init_db
+        db_path = init_db()
+        _emit(f"  ✓ Database OK ({db_path})")
+    except Exception as e:
+        _emit(f"  ❌ Database check failed: {e}")
+        errors.append(f"Database check failed: {e}")
+        # 迁移失败可能已经改了表结构（ALTER TABLE 不可逆）：光回滚代码不够，
+        # 把库也恢复到升级前的快照（Step 0c 的备份就是为这一刻留的）。
+        if pre_update_db_backup is not None:
+            if not _restore_db_after_failed_migration(
+                pre_update_db_backup, trade_home / "data" / "trade.db",
+                _emit, warnings,
+            ):
+                _emit(f"  ⚠ 数据库未能自动恢复，备份仍在：{pre_update_db_backup}")
+        # DB 迁移失败同样回退源码：新代码 + 未迁移完的库，重启只会更糟
+        _rollback_if_possible("database check failed")
+        return {"ok": False, "version": "", "error": str(e), "errors": errors, "warnings": warnings, "messages": messages}
+
+    # ── 结果 ──────────────────────────────────────────────────────────────
+    # errors 只装致命失败（git pull/clone、pip install、数据库），
+    # 非致命失败（skills、模板同步、开机自启）走 warnings，不影响重启
+    has_critical_errors = bool(errors)
+    ok = not has_critical_errors
+
+    # 注意：这里**不再**写 version.txt。
+    # version.txt 的语义是「正在运行的代码版本」，由 trade.app 在进程启动时写入。
+    # 若在此处提前写入目标版本，重启前的窗口里 UI 会显示新版本号，
+    # 一旦重启失败（或本次 ok=False）就成了「假升级成功」。
+
+    if ok:
+        # 记录"已更新待重启"现场：重启 watchdog 探活失败时回退到这里。
+        _record_pending_update(pre_update_sha, target_sha, new_version)
+        # 更新不再自动重启：用户看到结果后自己点重启（P1-10 的安全替代）
+        if warnings:
+            _emit(
+                f"\n✅ Trade update complete（{len(warnings)} 项警告）. "
+                "Restart Trade manually to apply."
+            )
+        else:
+            _emit("\n✅ Trade update complete. Restart Trade manually to apply.")
+    else:
+        _emit("\n⚠️  Update completed with errors. No restart scheduled.")
+    return {"ok": ok, "version": new_version, "target_sha": target_sha or "",
+            "errors": errors, "warnings": warnings, "messages": messages}

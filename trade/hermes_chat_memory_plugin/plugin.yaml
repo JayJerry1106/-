@@ -1,0 +1,9 @@
+name: chat-memory
+version: 1.0.0
+description: 查 trade 用户的对话历史（SQLite conversations 表，按 company_id 严格隔离）；并提供工具层守卫（文件路径白名单、terminal 命令白名单、拒绝 execute_code）。
+author: 路路通ai助手
+provides_tools:
+  - chat_memory_list
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
