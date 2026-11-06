@@ -1,0 +1,80 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.db
+*.db-shm
+*.db-wal
+.env
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+# Runtime data directory — NOT tracked (created on install/init)
+.trade/
+
+# Temp / generated files
+结构化知识库构建方法论.md
+daily-summary-template.md
+temp_market_report.md
+
+# Worktrees
+.worktrees/
+
+# Code intelligence indices (local only)
+.codegraph/
+.cursor/
+
+# Misc local files
+*.md.tmp
+文件类型处理方法整理.md
+# 分析/临时文档 — 不入库
+Trade-Hermes耦合评估.md
+Trade-Hermes解耦可行性.md
+代码复用评估.md
+test_write.txt
+
+# 本地工具文档（不入库）
+LICENSE-TOOL.md
+docs/license-keys-backup.txt
+.gstack/
+AI指令分析总结.md
+培训资料分析总结.md
+外贸业务资料包分析总结.md
+外贸产品营销战略工作流分析总结.md
+外贸业务知识库.md
+外贸业务知识库.en.md
+外贸业务方法总结.md
+外贸业务方法总结.en.md
+
+.agents/
+.claude/
+skills-lock.json
+.pytest_cache/
+.coverage
+AGENTS.md
+CLAUDE.md
+
+# 内部设计文档（本地保留，不入库）
+CHANGELOG.md
+项目需求文档.md
+项目需求文档.en.md
+业务概览.md
+业务概览.en.md
+使用说明书.md
+使用说明书.en.md
+Trade数据目录结构设计.md
+Trade数据目录结构设计.en.md
+docs/database-schema.md
+
+# 招标邮件抓取的正式配置：含 IMAP 授权码，由用户从 .example.json 复制后填写，禁止入库
+**/mail_accounts.json
+
+# 内部操作手册（作者远程处理客户机时用，含内部口令，不入库）
+公司管理命令说明.md
+docs/skill-development-guide.md
+docs/diagrams/
+docs/superpowers/
+windows-standalone/README.md
+.pre-commit-config.yaml

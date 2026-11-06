@@ -1,0 +1,259 @@
+# Hermes ↔ 路路通ai助手 兼容性记录
+
+> 每次 Hermes 升级后更新此文件。升级前先跑一次完整兼容性检查（见 `项目需求文档.md` 第二章）。
+
+## 当前策略（2026-10-14 起，取代此前所有 pin / 兼容窗口口径）
+
+> **一句话**：机器上只保留**一份**、且是**最新版**的 Hermes；路路通ai助手 跑在 **Python 3.14** 上，
+> 通过 `sys.path` 用那份 Hermes；Hermes 过旧时 **路路通ai助手 自己在后台升级它**并在界面显示进度。
+
+**为什么放弃「固定 tag + 兼容窗口」**
+
+1. **Python 版本是硬互斥的**：上游 ≤ v0.21.5 声明 `requires-python = ">=3.11,<3.14"`，
+   ≥ v0.21.6 声明 `>=3.11,<3.15` 且**只提供 3.14 的依赖集**（`>=3.11` 只是留给旧安装
+   跑完升级步骤的过渡桥）。实测：`pip install` 0.19.0 在 3.14 上直接
+   `ERROR: Package 'hermes-agent' requires a different Python`。路路通ai助手 是**进程内**嵌
+   Hermes 的，一个 venv 只能有一个 Python 版本 —— 不可能同时服务两代 Hermes。
+2. **固定的那份会和用户自己那份抢同一个 checkout**（都是 `~/.hermes/hermes-agent`）：
+   目录里已有检出时 `_clone_or_update` 会原样保留，pin 静默失效，还把用户的 Hermes
+   降级（install.sh 旧版 `ref != main → return 0` 分支即此）。而 index.md 的官方教程
+   Step 5 是从 **main** 装 Hermes —— 于是「装得上、起不来」对每个新用户必然发生。
+
+**为什么 路路通ai助手 能跑在 3.14 上（2026-10-14 隔离实测通过）**
+
+`pm/environments.py:activate_dependencies()` 会在 `import hermes_bootstrap` 时把
+`sys.path` 换成 Hermes 的托管环境 site-packages（**按目录名剥掉进程原有的全部
+site-packages**，且覆盖 `PYTHONPATH`，不检查任何开关）。路路通ai助手 的应对是**事后恢复**：
+把自身 site-packages 追加回 `sys.path` 末尾（让 Hermes 的依赖优先胜出冲突）并重设
+`PYTHONPATH`。实测结果：`hermes_bootstrap` 导入无重拉、`run_agent.AIAgent` 与
+路路通ai助手 依赖（pymupdf/openpyxl/python-docx/bs4/fastapi）可在同一进程共存，
+`openai` 正确来自 Hermes 的托管代际。
+
+> **架构红利**：路路通ai助手 的依赖装在 **路路通ai助手 自己的 venv** 里，**不在** pm 代际里 ——
+> Hermes 更新重建代际不会清掉它们。
+
+**过旧 Hermes 的处理（不阻断、自动升级）**
+
+- `trade/hermes_compat.hermes_python_compat()` 读 checkout 的 `requires-python` 与
+  安装印章版本判定，**全程不导入 Hermes**（旧 Hermes 在 3.14 上崩的是缺依赖的
+  `ImportError`，用 import 判只能得到天书，得不到「版本过旧」这个可行动的结论）。
+- 判定为过旧时 `setup()` **不再 `sys.exit`**：跳过一切会 import Hermes 的步骤、照常起服务，
+  由 `trade/hermes_upgrade.py` 在后台跑用户自己的 `hermes update`，界面显示进度（SSE）
+  并可重试；成功后自动重启 路路通ai助手。
+- **网络前置是硬约束**：升级前先用 `git ls-remote` 探 GitHub 可达性（不用裸 TCP —— 用户
+  可能配了代理，裸 TCP 会误判）。不通则**绝不开始**，只提示开代理：半途失败会同时弄坏
+  Hermes 与 路路通ai助手。
+- 安装脚本的收尾自检**忽略「Hermes 版本」这一致命项**（`has_fatal_failure(..., ignore_names=('Hermes 版本',))`），
+  否则安装会判失败退出，用户永远见不到那个升级界面。
+
+**干净机器实测暴露的两个坑（2026-10-15，已修，回归测试钉住）**
+
+新策略的第一版在干净机器上**装不上**，两个坑都不是「Hermes 版本」问题，而是本策略
+自身的实现缺口 —— 记在这里，因为它们正是「路径准备必须集中且早于一切 Hermes import」
+这条规则的理由：
+
+1. **自检绕过路径准备**：安装脚本收尾用裸 `python -c` 调 doctor，不走 `setup()`。而
+   Hermes 不再装进 路路通ai助手 的 venv，于是报 `No module named 'run_agent'` ——
+   **安装永远过不了自检**。修法：自检先调 `bootstrap.prepare_hermes_import_paths()`。
+2. **doctor 成了「第一个 import Hermes 的人」**：它自己 `from run_agent import AIAgent`
+   会触发 pm 激活，剥离 venv 的 site-packages 且**没人恢复**，导致 doctor 后面几项
+   （holehe / sqlite-vec）误报「未安装」。修法：`setup()` 里把
+   `prepare_hermes_import_paths()` 提到 `dispatch_subcommands()` **之前**。
+
+另有一个独立的装机体验问题：**「没配大模型」曾被当作致命安装失败**（`create_agent()`
+抛错 → 「Agent 构造」fatal）→ 新装机器永远看到「安装不完整，请发给技术支持」。现改为
+先查 `check_provider()`，未配置则报 WARN 并指向 `hermes setup`。
+
+**客户机事故（2026-10-15，Windows 旧装机器，三个 bug 已修）**
+
+现象：客户机器 trade 升到最新后显示要升级 Hermes → 卡在「正在检查网络」→ 客户手动重装
+Hermes → trade 能开、但一提问就回「AI Agent 模块未加载」。三个 bug 都是本策略自身的：
+
+1. **判定漏了「反向」那一半（致命）**：`requires-python` 里的 `>=3.11` 是上游留给旧安装
+   跑升级步骤的**过渡桥，不代表能运行**。于是「Hermes 0.22.0 + 解释器 3.13」被判成 `ok` ——
+   而旧装机器**就地升级 trade 时 venv 不会重建**（`trade update` 只更新代码与依赖），
+   正好制造了这个组合。判 ok 就走进正常路径 → pm 激活把 **cp314** 的包塞进 3.13 进程 →
+   `from run_agent import AIAgent` 抛 ImportError → 界面只显示「AI Agent 模块未加载」，
+   **完全指不到真正的原因**。修法：新增 verdict `python_too_old` + `fix` 字段
+   （`upgrade_hermes` / `rebuild_trade_venv`），两个方向的用户动作完全不同，必须分开给。
+2. **网络探测会永久挂住**：面板停在「正在检查网络」= 探测线程再也没返回。两道根因：
+   ① `git ls-remote` 撞到凭证提示会挂；② 即使有 `timeout=`，Windows 上孙进程（凭证助手）
+   持着管道句柄时 `communicate()` 会越过超时继续等。修法：**不给任何管道** +
+   `GIT_TERMINAL_PROMPT=0` / `GCM_INTERACTIVE=never` / `-c credential.helper=` +
+   再加一层**线程硬截止**（不依赖 subprocess 的超时语义）。`hermes update` 子进程同样
+   注入这些开关并断开 stdin —— 但它**不能加超时**（杀掉做到一半的 Hermes 升级更危险）。
+3. **安装脚本的 3.14 发现路径两个都错**：glob 的是 `tools/*/bin/python3.14`，而真实布局是
+   `installs/<key>/environments/<gen>/bin/python`（Windows 为 `Scripts\python.exe`）。
+   客户照做「重装」会卡在「需要 Python 3.14，但未找到」—— **自愈路径被堵死**。
+   同时安装脚本现在会**重建过旧的 venv**（解释器不是 3.14 就删掉重建；数据在 `TRADE_HOME`
+   下，删 venv 不丢任何用户数据），这样老装机器只需「关掉 路路通ai助手 → 重跑安装脚本」。
+
+**第二轮测试追加（2026-10-15 下午，用户报告）**
+
+上一轮那批修复里有两个我做错了，都是第二轮测试抓出来的：
+
+4. **3.14 的发现 glob 依然匹配不到真机布局**。我上一轮把 glob 从
+   `tools/*/bin/python3.14` 改成了 `installs/*/environments/*/bin/python` —— 仍然错，
+   因为**真实布局在代际里还套一层 `venv/`**，而且有**两棵代际树**：
+   ```
+   installs/<key>/environments/<gen>/venv/bin/python          ← 权威：pm/operations.py:152/210
+   installs/<key>/pm-runtime/generations/<gen>/bin/python      ← 权威：pm/install_states.py:72
+   ```
+   实测对比（同一份夹具）：旧 glob 匹配 **0 个**；`environments/*/venv/bin/python` 匹配 2 个
+   （其中一个是 3.13 干扰项）。⇒ 只靠 glob 不够，**必须按版本号验证**。
+   **更值得记的是方法问题**：我上一轮声称"隔离实测通过"，但那个"真实布局"是我按代码
+   推断**自己捏的 mock** —— 用同一个理解去构造夹具，只能验证我的假设，验证不了现实。
+   这次的修法是**不再写死布局**：`find … -maxdepth 6`（递归，对布局免疫）+ `_is_py314`
+   按版本号验；Windows 用 `-Recurse -Depth 6`。回归测试钉住「必须是递归 + 必须验版本」。
+5. **面板 UI 竞态**：`showHermesUpgradePanel` 设好 `rebuild_needed` 文案后，紧接着启动了
+   进度流；而重建场景下后端状态恒为 `idle`，流的第一个 state 事件就把标题盖回
+   「准备升级 Hermes」—— **正好又变成上一轮要消灭的那种误导**。修法：重建分支不启动流
+   （那里没有进度可看）。教训：JS 测试只测了「每个状态有文案」和「前后端字符串契约」，
+   **没测「设置文案后别的代码会不会覆盖它」这个交互**；现已补上并做过变异检验
+   （改回旧写法 → 测试变红）。
+
+**逻辑审查后的加固（2026-10-15，按优先级 ⓐ → ⓙ → ⓚ → 其余）**
+
+一次针对「这套新架构自己会不会咬人」的审查，改了 8 处（不改架构）：
+
+| 项 | 问题 | 加固 |
+|---|---|---|
+| ⓐ | `_trade_site_packages()` 解析不到时，路径恢复与 PYTHONPATH 修补**双双静默跳过** —— 进程表面能跑、实际只剩 Hermes 的依赖。这是唯一会「静默降级」的路径 | 改为响亮报错；并加测试钉住「`hermes_bootstrap` 已缓存（import 无副作用）时恢复仍生效」 |
+| ⓙ | 重建 venv 的 `rm -rf` 不可逆，用户手动 `pip install` 的包会丢 | 删除前 `pip freeze` 落档到 `$TRADE_HOME/venv-packages-before-rebuild.txt` |
+| ⓚ | `trade update` 在**非 路路通ai助手 venv** 的解释器下运行会用 `sys.executable` 装进全局 site-packages | 入口守卫 `_refuse_reason_for_interpreter()`（判据保守：只在确知 路路通ai助手 venv 存在且当前解释器不在其中、或根本不在任何 venv 时才拒绝），并测**接线**（只测函数本身发现不了漏接线） |
+| ⓒ | 升级子进程 stdout 块缓冲 → 界面整段看不到输出 | `_child_env()` 加 `PYTHONUNBUFFERED=1` |
+| ⓓ | `for line in proc.stdout` 会阻塞到子进程关 stdout；撞上非凭证类卡死（管理员弹窗/服务询问）就**永远停在 UPGRADING**，且重试被幂等判断顶回 | 「无输出看门狗」：超过 10 分钟无输出即 `kill` 并落 FAILED + 可重试。**复用探测那套硬截止思路，不做架构大改**（按用户明确要求） |
+| ⓔ | 若补救方向是「重建 路路通ai助手 运行环境」却跑了 `hermes update`，其 UPGRADING 会经 SSE 覆盖界面上的重建提示 | 不变量钉在**被调方**：`start_upgrade()` 自己拒绝（`fix != upgrade_hermes`），且**不改状态机**（改状态机会显示一个根本没在跑的进度） |
+| ⓕ | 升级端点没有限流（其他系统端点都有） | POST 用与其它系统端点同档（5/分钟）；SSE 流用更宽松的 30/分钟（长连接 + 重连，同档会把正常重连挡掉） |
+| ⓗ | SSE 终态判断 `if not running` 把 `IDLE` 也当终态 → 前端若先连上来会拿到空流 | 只有 `DONE / FAILED / OFFLINE` 才收尾 |
+| ⓘ | venv 重建时打印旧版本号用了 f-string，在 3.11 上 SyntaxError → 永远显示「未知」 | 改 `%` 格式化 |
+
+**ⓑ（诚实标注）**：`_MIN_HERMES_VERSION_314 = "0.21.6"` 是**按上游代码推断**的，没有在 0.21.6 真机验证过「它跑在 3.13 上会崩」。已在 `hermes_compat.py` 就地标注来源与置信度，并说明两侧误判代价**不对称**（误报=用户白跑一次重装；漏报=「AI Agent 模块未加载」，且另有 requires-python 区间判据兜住），故维持「宁可误报」。
+
+**明确不做**：ⓖ（多客户端重发日志 —— 同机多标签几乎不会发生）、ⓛ（`_call_with_deadline` 的 daemon 线程不回收 —— 需数千次/秒才撞到）。审查报告另标注 ⓒ/ⓓ 的 **Windows 真机路径**仍未经真机验证（Linux 上验的是通用机制）。
+
+**新增耦合点：Hermes 插件机制（2026-10-16）**
+
+路路通ai助手 现在通过 **Hermes 的插件扩展点**给 agent 提供一个工具（`chat_memory_list`，查
+`conversations` 表的历史对话）。这引入两个**上游 API 依赖**，升级 Hermes 时要一并复核：
+
+| 依赖 | 位置（v0.22.1） | 复核要点 |
+|---|---|---|
+| `ctx.register_tool(name, toolset, schema, handler, check_fn, emoji)` | `hermes_cli/plugins.py`（插件加载器传入的 `ctx`） | 签名/关键字是否变；`toolset` 的注册语义是否变 |
+| 插件发现路径 + **opt-in 语义** | `hermes_cli/plugins.py` 头（`~/.hermes/plugins/<name>/`）、`plugins_discovery.py::_get_enabled_plugins`/`gate_manifest` | 发现路径是否变；**是否仍是 opt-in**（现在是：不在 `plugins.enabled` 里就不加载）；`plugins.disabled` 是否仍压过 `enabled` |
+
+**实测确认的版本区间**：`ctx.register_tool` 在 `v0.21.6 / v0.21.7 / v0.22.1` 三个版本都存在
+（`git grep "def register_tool" <tag> -- hermes_cli/plugins.py` 各命中 1 处）。
+
+**路路通ai助手 侧的对应实现**（改 Hermes 时对照看）：
+- 插件本体：`trade/hermes_chat_memory_plugin/{plugin.yaml,tools.py,__init__.py}`
+- 部署：`trade/bootstrap.py::sync_chat_memory_plugin()`（hash 比对、幂等，装到
+  `~/.hermes/plugins/chat-memory/`）
+- 启用：`trade/bootstrap.py::ensure_chat_memory_plugin_enabled()`（**只**追加
+  `plugins.enabled` 一个键；先 PyYAML 只读确认值形态，形态不对就不写；写前留 `.bak`）
+
+**版本口径**
+
+- 下限：**Hermes 0.21.6**（`trade/bootstrap.py::_MIN_HERMES_VERSION`、
+  `pre_install_check.py::MIN_COMPATIBLE_VERSION`，两处有测试钉住一致）。
+- **上限：无。** 新版 Hermes 一律要跟；`_MAX_HERMES_VERSION` 已删除。
+- 每次 Hermes 升级仍需复核：**重点是 `pm/` 的行为**（激活是否仍在 import 时发生、是否
+  仍按目录名剥离、是否有新的 opt-out），而不只是符号面 —— 符号面全绿但 import 副作用
+  改了的坑已经踩过一次（见下方「上游 main 跟进记录」与「静态核对的盲区」）。
+
+## 兼容性矩阵
+
+
+| Hermes 版本 | 兼容状态 | 测试日期 | 测试人 | 备注 |
+|------------|---------|---------|--------|------|
+| 0.12.0 | ⚠️ 不再支持 | 2026-05-11 | — | 低于最低兼容版本 0.13.0，启动时拒绝 |
+| 0.13.0 | ✅ 兼容 | 2026-05-11 | AI | API 检查通过：AIAgent/MemoryProvider/load_config 均无 breaking change |
+| 0.14.0 | ✅ 兼容 | 2026-05-18 | AI | config.model 从嵌套 dict 变为扁平字符串；name_to_models 移除。已适配。 |
+| 0.15.0 | ✅ 兼容 | 2026-05-29 | AI | run_agent.py 拆分到 agent/ 但 AIAgent re-export 正常；config.model / _PROVIDER_MODELS 未变。 |
+| 0.16.0 | ✅ 兼容 | 2026-06-11 | AI | 扫描了 origin/main 领先 387 commits：AIAgent 新增可选参数（tool_progress_mode/read_terminal_callback）向后兼容；config.model 格式不变；_PROVIDER_MODELS 结构不变；hermes_constants 无变更。无需 路路通ai助手 修改。 |
+| 0.17.0 | ✅ 兼容 | 2026-06-24 | AI | v2026.6.19 版本。AIAgent 重构为 `agent.agent_init.init_agent` 转发器；load_config/PROVIDER_REGISTRY/_PROVIDER_MODELS/get_hermes_home/load_hermes_dotenv 均无 breaking change。 |
+| 0.18.0 | ✅ 兼容 | 2026-07-06 | AI | v2026.7.1 版本。扫描 release notes 无 breaking change 涉及 路路通ai助手 耦合点（AIAgent/load_config/_PROVIDER_MODELS/get_hermes_home/gateway）。packaging/psutil/pyyaml/pydantic 版本未变。仅需更新 `_MAX_HERMES_VERSION` 到 0.19.0。 |
+| 0.19.0 | ✅ 兼容 | 2026-07-22 | AI | v2026.7.20 "Quicksilver" 版本。扫描 release notes 无 breaking change 涉及 路路通ai助手 耦合点（AIAgent/load_config/_PROVIDER_MODELS/get_hermes_home/gateway）。新增 Fireworks AI / DeepInfra provider、GPT-5.6 等模型、订阅管理、SecretSource 接口。仅需更新 `_MAX_HERMES_VERSION` 到 0.20.0。 |
+| 0.20.0 | ✅ 兼容 | 2026-08-03 | AI | v2026.8.3 "The Herald" 版本。扫描 release notes 无 breaking change 涉及 路路通ai助手 耦合点。注意：brew+pip/PyPI wheel 渠道退役（安装方式变化）、Node 26 要求、默认 tool-calling iteration limit 90→500（路路通ai助手 显式设置 max_iterations 不受影响）。仅需更新 `_MAX_HERMES_VERSION` 到 0.21.0。 |
+| 0.20.3 | ✅ 兼容 | 2026-08-18 | AI | v2026.8.16.2 版本（0.20.1~0.20.3 三个 patch rollup）。`compare/v2026.8.3...v2026.8.16.2` 确认 路路通ai助手 7 个耦合点入口（run_agent.py 的 AIAgent / hermes_cli.config/auth/models/env_loader / hermes_constants）零变更；agent/ 内部实现有更新但 路路通ai助手 不直接 import。无 breaking change，仍在 `<0.21.0` 范围内，`_MAX_HERMES_VERSION` 无需改动。仅更新 pyproject.toml git pin。 |
+| 0.20.5 | ✅ 兼容 | 2026-08-24 | AI | v2026.8.19 版本（0.20.4~0.20.5 两个 patch rollup，共 963 commits）。`compare/v2026.8.16.2...v2026.8.19` 确认 路路通ai助手 7 个耦合点入口零变更；新增 keyless 免费 tier、cron 持久记忆等均不涉及 路路通ai助手 耦合点。无 breaking change，仍在 `<0.21.0` 范围内，`_MAX_HERMES_VERSION` 无需改动。仅更新 pyproject.toml git pin。 |
+| 0.20.6 | ✅ 兼容 | 2026-08-31 | AI | v2026.8.27 版本（0.20.5→0.20.6 单个 patch rollup，共 1376 commits）。`compare/v2026.8.19...v2026.8.27` 确认 路路通ai助手 7 个耦合点入口零变更；web_search TTL 缓存、updater 经 control socket 暂停 gateway、新模型（GLM-5.3-Flash/MiniMax M3 free）等均不涉及 路路通ai助手 耦合点。无 breaking change，仍在 `<0.21.0` 范围内，`_MAX_HERMES_VERSION` 无需改动。仅更新 pyproject.toml git pin。 |
+| 0.21.0 | ✅ 兼容 | 2026-09-03 | AI | v2026.8.31 "The Pantheon" 版本（自 0.20.0 共 ~5800 commits / ~2475 PRs，含 Bot Mode、gateway 消息平台、CLI 大改）。`compare/v2026.8.27...v2026.8.31` 确认 路路通ai助手 7 个耦合点入口零变更（run_agent.py / hermes_cli.config/auth/models/env_loader / hermes_constants 全未动）；agent/ 内部 54 文件变更不涉及 路路通ai助手；skills/memory 写保护属 Hermes 工具层，不影响 路路通ai助手 外部文件复制式 skills 安装。需更新 `_MAX_HERMES_VERSION` 到 0.22.0 + pyproject.toml git pin。 |
+| 0.21.1 | ✅ 兼容 | 2026-09-08 | AI | v2026.9.7 版本（0.21.0→0.21.1 patch rollup，共 5995 commits / ~632 PRs：代码模块化、性能优化、provider/模型更新、cron 与 delegation 修复）。`compare/v2026.8.31...v2026.9.7` 确认 路路通ai助手 7 个耦合点入口零变更。无 breaking change，仍在 `<0.22.0` 范围内，`_MAX_HERMES_VERSION` 无需改动。仅更新 pyproject.toml git pin。 |
+| 0.21.2 | ✅ 兼容 | 2026-09-14 | AI | v2026.9.11 "state.db Patch Release" 版本（0.21.1→0.21.2，共 986 commits / 312 PRs）。核心为 state.db 可靠性战役（修 0.21.0 引入的 session store 连接处理问题：多写入者锁冲突、损坏误报、坏行崩溃、打开抢锁卡顿），对已跟随 0.21.0 的用户有实际修复价值。`compare/v2026.9.7...v2026.9.11` 确认 路路通ai助手 7 个耦合点入口零变更。无 breaking change，仍在 `<0.22.0` 范围内，`_MAX_HERMES_VERSION` 无需改动。仅更新 pyproject.toml git pin。 |
+| 0.21.3 | ✅ 兼容 | 2026-09-15 | AI | v2026.9.14 版本（0.21.2→0.21.3，共 1039 commits / ~338 PRs）。重点：长驻进程 state.db writer handle 泄漏修复（直接相关——路路通ai助手 会 spawn `hermes gateway run` 长驻子进程）、远程 Desktop/Cloud 登录修复、模型目录更新。`compare/v2026.9.11...v2026.9.14` 确认 路路通ai助手 7 个耦合点入口零变更。无 breaking change，仍在 `<0.22.0` 范围内，`_MAX_HERMES_VERSION` 无需改动。仅更新 pyproject.toml git pin。 |
+| 0.21.4 | ✅ 兼容 | 2026-09-22 | AI | v2026.9.21 版本（0.21.3→0.21.4，共 5173 commits / 5169 文件 / 1812 PRs；完整说明留待 v0.22.0）。逐文件比对确认 路路通ai助手 7 个耦合点签名全部保留：AIAgent 的 11 个已用参数均在（新增 `connection_callback`/`cwd` 为可选）、`ProviderConfig` 字段零变更、`_PROVIDER_MODELS`/`get_hermes_home`/`load_hermes_dotenv(hermes_home=)` 均未破坏；`load_config` 新增 `_normalize_root_model_keys` 会把 model 归一化为 dict，路路通ai助手 已同时兼容 dict/str。两个新变化不构成破坏：① `hermes gateway run` 新增 host 级单例锁与 attach（已有 gateway 时新进程 attach 后 exit 0），路路通ai助手 的 `_is_gateway_running()` 预检已覆盖；② 新增 `skills.auto_load` 配置默认 `[]`（opt-in），路路通ai助手 不设置。**真机验证**（本机 hermes 0.20.4→0.21.4 后）：`/api/status`、`/api/trade/models/providers`（78 providers）、`/api/trade/companies`、`/api/trade/chat`（同步）、`/api/trade/chat/stream`（SSE：thinking→response→done）全部通过。注意上游行为变化：MoA preset 的 `reference_max_tokens`/`max_tokens` 已从规范化中移除（配置里设置将不再生效），改由 `auxiliary.moa_reference` 控制。无 breaking change，仍在 `<0.22.0` 范围内，`_MAX_HERMES_VERSION` 无需改动。仅更新 pyproject.toml git pin。 |
+| 0.21.5 | ✅ 兼容 | 2026-09-28 | AI | v2026.9.24 版本（0.21.4→0.21.5，共 1148 commits）。逐符号核对 路路通ai助手 7 个耦合点：`run_agent.AIAgent` 仍在（组合式实现，`run_conversation(task_id=)` / `chat()` 由 `TurnFacadeMixin` 提供，签名未变）、`hermes_cli.config.load_config`、`auth.PROVIDER_REGISTRY` / `get_auth_status`、`models._PROVIDER_MODELS` / `provider_model_ids`、`env_loader.load_hermes_dotenv`、`hermes_constants.get_hermes_home` 全部保留；`hermes_cli/provider_catalog.py` 文件未变；`tool_complete_callback` / `ephemeral_system_prompt` 构造参数健在。另核对**上游 main**（比本地基线多 5045 commits）：`hermes_cli.__version__` 已改为惰性读安装印章 `install-stamp.json`，**无印章时返回 "0.0.0"**，并新增 `hermes_cli.version_info.get_version_info()`（安装印章 → live git → unknown，明确选择降级不崩）。这会让 路路通ai助手 的启动门禁把 0.0.0 误判成「版本过旧」而拒绝启动 —— 已修：`trade/hermes_compat.hermes_version()` 改为多源识别（version_info → `__version__` → checkout pyproject），占位值与不可解析值一律按「未知」处理、警告后继续启动；`pre_install_check.py` 同原则同步（`0.0.0` 与带 `+git` 后缀的派生版本不再判「过旧」）。无 breaking change，仍在 `<0.22.0` 范围内，`_MAX_HERMES_VERSION` 无需改动。 |
+
+| 0.21.6 | ✅ 兼容 | 2026-10-10 | AI | **v0.21.6**（2026-10-08 发布）。注意上游从此改用**语义化 tag**（`v0.21.6`），不再是 `v2026.9.24` 那种日期式命名。本 release 内 **8 个耦合文件全部被动过**，逐个拉 tag 上的实际内容核符号，全部健在且签名未变：`run_agent.AIAgent` 在且 路路通ai助手 实际传的 **14 个构造参数一个不少**、`config.load_config() -> Dict[str, Any]`、`auth.PROVIDER_REGISTRY` / `get_auth_status(provider_id=None)`、`models.provider_model_ids(provider, *, force_refresh=False)` / `_PROVIDER_MODELS`、`env_loader.load_hermes_dotenv(*, hermes_home=, …)`、`hermes_constants.get_hermes_home() -> Path`、`version_info.get_version_info() -> VersionInfo`、`provider_catalog.provider_catalog() -> list[ProviderDescriptor]`。Release 说明里无 BREAKING/removed/rename/deprecated 字样。**单独核过一条行为风险**：10-08 的 `refactor(approval): one session /yolo contract` 把三份会话级 YOLO 持久化实现收进 `tools/approval_yolo.py` —— 它只**新增**会话级开关，路路通ai助手 依赖的**进程级环境变量**未受影响：`tools/approval.py:46` 仍是 `_YOLO_MODE_FROZEN = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))`，并在 :326/:487 的放行判定中使用。无 breaking change，仍在 `<0.22.0` 范围内，`_MAX_HERMES_VERSION` 无需改动；路路通ai助手 无需改代码。**⚠️ 2026-10-14 真机会诊推翻本行结论**：该 tag 已含 `pm/` 托管运行时，import 时激活会劫持 路路通ai助手 进程依赖集（见顶部「进程内嵌硬不兼容」警告）。 |
+| 0.21.7 | ❌ 不兼容（2026-10-14 真机实测推翻静态结论） | 2026-10-12 / 10-14 | AI | **v0.21.7**（2026-10-12 发布；v0.21.6→v0.21.7 共 **777 commits**，主力是 release/CI/测试，功能面含 terminal `persistent_shell` 修复、Codex 请求体 zstd 压缩）。本 release 内 7 个耦合文件有改动（auth ±201 / config ±202 / run_agent ±106 / env_loader ±27 / hermes_constants ±7 / models ±4 / version_info ±4；`provider_catalog` 未动），但 **v0.21.7 上这些文件的最终内容与上游 main tip 完全一致** —— 与当日 main 复核是同一批内容，逐符号核对结论直接成立：`AIAgent.__init__` 共 86 形参、路路通ai助手 传的 **14 个全部保留**（无 `**kwargs` 兜底）；`load_config()` / `get_auth_status(provider_id)` / `provider_model_ids(provider, *, force_refresh)` / `provider_catalog()` / `load_hermes_dotenv(*, hermes_home=…)` / `get_hermes_home()` / `get_version_info()` 签名未变；`PROVIDER_REGISTRY` 的 `base_url_env_var`/`auth_type`/`api_key_env_vars` 仍在；`agent.tools` 仍由 `agent/agent_init.py` 赋值；`HERMES_DISABLE_LAZY_INSTALLS` 与 `gateway` 子命令仍在。**新增 toolset 逐个核对，结论均不应启用**：`connections`/`catalog`（`tools/connectors/`）受 portal 门控（`connectors_available()`，本地无 portal 时不出现），`setup`/`start_chat` 是 CLI 向导便利工具，`example` 是 AGENTS.md 示例；`homeassistant` 被移除（路路通ai助手 未用）。版本面：v0.21.7 的 pyproject 是占位 `0.0.0`、`__version__` 改为惰性读安装印章，源码检出由 `version_info` 经语义化 tag 解出 **0.21.7** —— 仍在 `<0.22.0` 窗口内，`_MAX_HERMES_VERSION` 无需改动；路路通ai助手 的多源版本识别已覆盖该情形。区间内无 BREAKING/CVE 关键词命中。**结论：路路通ai助手 无需改代码。但 ⚠️ 2026-10-13 发现 v0.21.7 的依赖被标成 Python 3.14+，在 3.11–3.13 上装不出依赖（见文件顶部「安装 pin 硬约束」）——所以它**不能**作为安装 pin；安装 pin 定为 `v2026.9.24`（0.21.5）。本机（0.21.4 基线）暂不升级。** 附带观察：上游发布节奏约 3–4 天一个 release（0.21.5 09-28 → 0.21.6 10-08 → 0.21.7 10-12），单 release 千级提交，现有「跟随」模式的维护成本由此可量化。**❌ 2026-10-14 真机升级实测（main@d97007c32d = v0.21.7+758）推翻了上段静态结论**：静态核对只覆盖了 7 个耦合文件的符号面，漏掉了 `hermes_bootstrap.py` 新增的 pm 重拉/依赖激活机制 —— 它在 import 时把进程 sys.path 换成 3.14 托管环境，路路通ai助手 进程依赖集被劫持（实测：doctor 里 holehe/sqlite-vec/fitz 全「未安装」、openai 因 `pydantic_core` ABI 不符崩、`trade doctor` 被 runpy 重拉后 2 秒崩）。已回滚本机，详见下方跟进记录。 |
+
+| 0.22.0 | ✅ 兼容（新策略下） | 2026-10-14 | AI | **v0.22.0**（tag `e06df9c2`，2026-10-13 发布；`v0.21.7→v0.22.0` 756 commits，`v2026.9.24→v0.22.0` 10,713 commits）。8 个耦合点逐个核对：`AIAgent.__init__` 86 形参、路路通ai助手 实传的 **14 个全部保留**（无 `**kwargs` 兜底）；`load_config()` / `get_auth_status(provider_id=None)` / `provider_model_ids(provider, force_refresh)` / `load_hermes_dotenv(hermes_home, project_env, load_external_secrets)` / `get_hermes_home()` / `provider_catalog()` / `get_version_info()` 签名均未变；`PROVIDER_REGISTRY`（`auth.py:246`）、`_PROVIDER_MODELS`（由 `models_catalog_static.py` 转出）仍在。**`pm/` 行为未变**：`hermes_bootstrap.py:613` 仍无条件 `activate_dependencies(_root)`，`pm/environments.py:449` 仍按目录名剥离 site-packages，**仍无 opt-out** —— 新策略（3.14 + 事后恢复）正对此而设计。注意：`d97007c`（10-14 真机升级目标，即"v0.21.7+758"）**只比 v0.22.0 多 2 个提交**（均为 Docker release CI 修复），且 `hermes_bootstrap.py` / `pm/environments.py` / `run_agent.py` 三点间零差异 ⇒ 10-14 那次真机失败**就是 v0.22.0**，无需再上机复现。另：`requires-python` 仍 `>=3.11,<3.15`（3.14 才可运行），`rc.1-v0.22.1` 已在 RC。 |
+
+| 0.22.1 | ✅ 兼容（静态复核通过，**无需改 路路通ai助手 代码**） | 2026-10-15 | AI | **v0.22.1**（tag `297552a9`，2026-10-14 发布；`v0.22.0→v0.22.1` **2216 commits**）。**按「复核重点」逐条核过，第一优先项是 `pm/` 而非符号面**：① **`pm/environments.py` 逐字节未变**（`activate_dependencies` 仍在 `hermes_bootstrap` import 时无条件执行、仍按目录名剥离 site-packages —— 剥离那行两版同为 `:492`）；② `hermes_bootstrap.py` 未变 ⇒ **import 时副作用不变**；③ `pm/` 与 `hermes_bootstrap.py` 的 diff 里**没有新增任何 `HERMES_*` 开关** ⇒ 仍无 opt-out。符号面：`run_agent.py` **未改**，`AIAgent.__init__` 87 形参（较 0.22.0 +1），**路路通ai助手 实传的 14 个全在**且无 `**kwargs` 兜底；`load_config()` / `get_auth_status(provider_id)` / `provider_model_ids(provider, force_refresh)` / `load_hermes_dotenv(hermes_home, project_env, load_external_secrets)` / `get_hermes_home()` / `provider_catalog()` / `get_version_info()` 签名均未变。`hermes_cli/config.py` 看似 −205 行，实为 `hermes config show` 的**终端展示函数**（`_show_model_section` 等）重构成 `_cmd_config_show`；`load_config` 实现未动，只在 `_load_config_impl` 前多了一个 **PM-worker 专用**的 `_worker_config_snapshot()` 分支（路路通ai助手 场景下返回 None，走原路径），路路通ai助手 依赖的 `_normalize_root_model_keys` 仍在 `config.py:1722`。`requires-python` 仍 `>=3.11,<3.15` ⇒ 路路通ai助手 的 3.14 前提与判定逻辑不变。安装印章 schema（`baseVersion`/`displayVersion`）未变 ⇒ 路路通ai助手 的版本识别仍有效；安装脚本 glob 依赖的布局常量（`installs_root`/`install_key`/`environments`/`venv_bin_dir`）全在**未改动的** `pm/environments.py` 里 ⇒ glob 仍有效。**本版值得注意**：`pm/user_facing.py`（+152，新）改的是 **PATH 顺序**「用户自己的工具优先、Hermes 的在后」，注释点名 Windows 的 `Scripts\python.exe` 场景 —— 属上游在修 Windows 路径问题，方向对 路路通ai助手 有利；`pm/network.py`(+28)/`pm/progress.py`(+13) 涉及网络与进度反馈。**⚠️ 下一版复核的 watch 项**：`activate_dependencies()` 会**改写 PATH**（把 Hermes 的 bin 前置），而 路路通ai助手 的恢复只覆盖 `sys.path` 与 `PYTHONPATH`，**没有恢复 PATH**。本版上游动了 PATH 策略，故下次复核要再看一眼是否需要一并恢复（注意不能简单「恢复成原样」—— agent 的 terminal 工具可能正需要 Hermes 的工具在 PATH 上，这是个取舍，非明确 bug）。**未做真机升级验证**：按本文件「静态核对的盲区」条，静态复核只作初筛；这次因 `pm/` 与 `hermes_bootstrap` 均未改，风险面显著小于 0.21.6 那次（那次正是这两个文件变了）。 |
+| 0.22.2 | ✅ 兼容（真机验证） | 2026-10-21 | AI | **v0.22.2**（tag `7b77e29e`，2026-10-15 发布；`v0.22.1→v0.22.2` 的 diff 范围比 release notes 大 —— 含 `hermes_cli/config.py` +205/−44 等改动，按 diff 为准）。**本机真机现状**：Hermes 0.22.2 + 路路通ai助手 0.6.8 服务正常；`trade doctor` 仅 Hindsight / sentence-transformers 两个已知可选降级；`AIAgent` 构造成功、路路通ai助手 实传的 **14 个参数全在**。**0.22 行为变化与影响**：① 工具表改为**懒加载表面** —— 直接暴露 17 个核心工具（含 `tool_search`/`tool_describe`/`tool_call`、`skill_view`、`vision_analyze`），todo/插件等非核心 toolset 延迟进目录、经 `tool_search` 可检索调用，**无能力丢失**；② `cronjob` 工具仅在交互/gateway 会话可用（by design —— 路路通ai助手 的定时任务走 gateway 调度，10-21 早安简报实测照常 on time 执行）；③ Hindsight 等记忆 provider 改为 catalog 插件（路路通ai助手 按设计降级）；④ 工具改名 `todo→todo_list` / `cronjob→cronjob_manage` / `process→process_manage`，旧名兼容，路路通ai助手 未按名依赖。**观察（非阻断）**：路路通ai助手 的 gateway 存活判断用 TCP 8642，0.22 在 api_server 未启用时该端口不监听 → 每次启动会多余 spawn 一次（日志 `already serves ... nothing to start`，无害）；**2026-10-21 已修**：`trade/app.py` 改用 Hermes 自身的 `gateway.find_gateway_pids()`（与 `hermes gateway status` 同源：PID 文件 + 服务管理器 + 严格 argv 扫描），导入失败才回退旧探测；新增 `tests/test_gateway_liveness.py`（6 条），本机实测走严格探测（非回退）。 |
+
+## 上游 main 跟进记录
+
+Hermes 的安装按「当前策略」跟随**最新 stable release**（2026-10-14 起无固定 tag / 无 pin；
+旧 pin 时代的口径见文件顶部历史）。**复核上游 main 仍然必要**：它是「下一个 release 里会发生什么」
+的预警（历史多次靠它提前发现签名/行为变化）。这里记录**未伴随新 release 的 main 复核**；
+伴随 release 的复核记在上方矩阵的对应行里。
+
+复核方法：用 GitHub API（`/commits?path=<文件>&sha=main&per_page=1`）逐个查 路路通ai助手 耦合点文件的
+最后改动时间，与本地检出基线比较；有改动的再拉当前内容核对具体符号与签名 —— 上游仓库体量大、
+本机装不起 main，故用静态符号核对而非运行验证。
+
+> 2026-10-12 起改用更省事的办法：在本地检出上 `git fetch --shallow-since=<基线日期> origin main`，
+> 然后直接 `git diff HEAD origin/main -- <耦合文件>` 看全量差异、`git show origin/main:<文件>`
+> 取上游当前实现做符号/签名核对（AST 解析取形参，别用手写正则 —— `dict[str, Any] | None`
+> 这类注解里的逗号会让正则漏报）。fetch 只更新 `.git` 里的对象与 refs，**工作树不动**，
+> 生产代码不受影响（核对前后 `git status` 应保持干净）。该方法比 API 更全、无速率限制。
+
+| 复核日期 | 上游 main | 本地基线 | 期内有改动的耦合文件 | 结论 |
+|---------|-----------|---------|------------------|------|
+| 2026-09-30 | `f42f579c` | `d275e422` (2026-09-23) | 7 个耦合点文件被改：run_agent.py / config.py / auth.py / env_loader.py / models.py / hermes_constants.py / version_info.py（另 `auxiliary_client.py`、`vision_tools.py` 亦有改动，非 路路通ai助手 耦合点；`agent/image_routing.py` 未动） | ✅ 无破坏。`AIAgent` 仍在且 路路通ai助手 实际传的 **14 个构造参数全部保留**；`load_config()` / `PROVIDER_REGISTRY` / `get_auth_status()` / `provider_model_ids()` / `_PROVIDER_MODELS` / `load_hermes_dotenv(hermes_home=)` / `get_hermes_home()` / `provider_catalog()` / `get_version_info()` 签名均未变。无需改动 路路通ai助手。 |
+| 2026-10-03 | `1cb26bf2` | `d275e422` (2026-09-23) | 4 个：run_agent.py（reasoning blob 容错修复）、config.py + env_loader.py（原子写入临时文件的内部重构）、models.py（StepFun 模型列表合并） | ✅ 无破坏。与上一行同一批符号逐个复核仍未变；`provider_model_ids(provider, *, force_refresh=False)` 与 `_PROVIDER_MODELS` 均保留。无需改动 路路通ai助手，`_MAX_HERMES_VERSION` 无需改动。 |
+| 2026-10-07 | `9b38eb14` | `d275e422` (2026-09-23) | 6 个（均 10-06）：run_agent.py（free tier 限流处理）、config.py（**移除内置 tirith 扫描器**）、auth.py（free-tier 重构）、models.py + provider_catalog.py（pre-release profile 不进发现列表）、hermes_constants.py（scratch 清理记账） | ✅ 无破坏。同一批符号逐个复核未变：`AIAgent` 的 14 个参数、`load_config()`、`PROVIDER_REGISTRY` / `get_auth_status()`、`provider_model_ids()` / `_PROVIDER_MODELS`、`get_hermes_home()`、`provider_catalog()` 全部保留。唯一「移除」是内置 **tirith** 预执行扫描器，**对 路路通ai助手 零影响**：路路通ai助手 代码完全不引用它，`~/.hermes/config.yaml` 里相关键也只出现在注释行。无需改动 路路通ai助手。 |
+| 2026-10-12 | `835c3dd0` | `d275e422` (2026-09-23) | **8 个耦合点文件全部有改动**（区间共 **10,105 个提交**，最新日期 tag `v2026.9.24`）：run_agent.py(±284) / config.py(±1118) / auth.py(±478) / env_loader.py(±216) / models.py(±546) / provider_catalog.py(±8) / **version_info.py（+332，新增模块）** / hermes_constants.py(±560) | ✅ 无破坏，建议**不跟随**（与「冻结 + vendor」路线一致）。逐符号复核：`AIAgent` 仍在、`__init__` 共 86 个形参且 路路通ai助手 传的 **14 个全部保留**（无 `**kwargs` 兜底，故「保留」有意义）；`load_config()` / `get_auth_status(provider_id)` / `provider_model_ids(provider, *, force_refresh)` / `provider_catalog()` / `load_hermes_dotenv(*, hermes_home=…)` / `get_hermes_home()` / `get_version_info()` 签名均未变；`PROVIDER_REGISTRY` 的 `base_url_env_var` / `auth_type` / `api_key_env_vars` 属性仍在；`agent.tools`（`doctor._agent_tool_names` 读的工具表）仍由 `agent/agent_init.py` 赋值；`HERMES_DISABLE_LAZY_INSTALLS` 开关与 `gateway` 子命令均保留。区间内安全类提交集中在 **路路通ai助手 不使用的消息适配器**（line / webhook / whatsapp_cloud / memory-provider hand-off），无影响 路路通ai助手 的面。版本仍落窗口内（最新语义化 tag `v0.21.6` < `0.22.0`；上游 main 的 pyproject 现为占位 `0.0.0`，路路通ai助手 的 `_is_real_version()` 已按「识别不到」处理，不会误判不兼容 —— 该预判被现实验证）。 |
+| 2026-10-14 | `d97007c3` | `d275e422` (2026-09-23) | **本机真机升级实测**（非静态核对，10,854 commits）：`hermes_bootstrap.py` 新增 pm 重拉/激活机制（`prepare_launch` → `os.execv`；`pm/environments.py:activate_dependencies`） | ❌ **发现进程内嵌硬不兼容，已回滚**。现场时间线：升级后首次 Hermes import 触发「更新收尾」（技能同步 / config **v46→v50 迁移**（误删 `auxiliary.vision`，已恢复）/ 建 **370MB** Python 3.14 托管环境 / 改写 `~/.local/bin/hermes` 启动器（已恢复）/ `pip install -e` 刷新印章）。随后 `trade doctor` 每次 **~2 秒崩**（runpy 重拉 `server.py` → 无 trade 包）；加 `HERMES_DISABLE_LAZY_INSTALLS=1` 后不崩，但**依赖仍被劫持**（doctor 里 holehe/sqlite-vec/fitz 全「未安装」；`import openai` 因 `pydantic_core` 是 cp314 在本进程 3.13 上崩）—— 根因是 `activate_dependencies()` **不检查任何开关**，把 sys.path 换成托管环境 3.14 site-packages。处理：回滚 checkout 至 `d275e422`、清理 `~/.hermes/installs/`（370MB）、恢复启动器与配置、重装 editable 元数据，doctor 全绿（仅剩 Hindsight / sentence-transformers 两个既有可选降级项）。**本机基线保持 `d275e422`，不跟随 main，直到上游提供 opt-out 或 路路通ai助手 改子进程架构。** 路路通ai助手 侧加固：`setup()` 第 0 步先设 `HERMES_DISABLE_LAZY_INSTALLS`（覆盖子命令分发与版本检查两个早于 `load_env_and_set_yolo()` 的窗口；含回归测试 + mutation 验证）。 |
+| 2026-10-21 | `0b8dee00` | `d923a5eb` (v0.22.2) | 2953 commits：auth ±4 / **config.py ±249（回退了 v0.22.2 引入的重构，净 −205/+44）** / env_loader +10 / models ±70 / hermes_constants ±109 / run_agent ±22 | ✅ 无符号破坏：8 个耦合入口全部保留，`AIAgent` 实传的 14 个参数全在。⚠️ `config.py` 在主线被回退 → v0.22.2 的 config 重构还有后续调整；**不手动跟 main**，等下一个 stable（v0.22.3-rc 已在造），届时按策略自动升级 + 真机验证（服务 / agent 构造 / 工具表 / cron 四项）。 |
+
+**静态核对的盲区**（历次复核都受此限制，记录以免误以为「查过了就没事」）：
+① 无法发现**签名不变但行为变了**的符号 —— 这类只能靠真机跑端点暴露；
+② 无法发现上游新增了 路路通ai助手 **应该启用却没启用**的 toolset —— 默认 toolset 组合缺 `vision`
+就是靠真机跑 `create_agent()` 打印工具表才发现的（导致 agent 一直没有 `vision_analyze`，
+自写 OCR 兜底）。所以每次跟随 release 时，仍应做一次真机端点验证；
+③ 无法发现 **import 时执行副作用**的模块 —— 2026-10-14 的 pm 事故（`hermes_bootstrap`
+在 import 时重拉进程 / 激活托管环境依赖）就是这一类：符号面全绿、静态看不错，
+真机一导就炸。**结论：v0.21.6 起的任何跟随，必须真机升级验证，静态核对只作初筛。**
+
+## 升级检查流程
+
+当 Hermes 发布新版本时，按以下步骤验证：
+
+```
+1. pip install hermes-agent@新版本（或更新 pyproject.toml 中的 git tag）
+2. python server.py --no-browser
+3. 如果启动检查通过，手动执行以下验证：
+   a. /api/trade/chat 端点正常
+   b. /api/trade/chat/stream 端点正常
+   c. /api/trade/models/providers 端点正常（验证 config.model 解析）
+   d. 文档提取功能正常
+4. 全部通过 → 更新上方矩阵 + 更新 pyproject.toml 的 tested 版本注释
+```
+
+> 另：Hermes 的耦合点在 `trade/` 内的完整清单见 `CLAUDE.md` 的「Hermes Coupling Points」一节；
+> 代码里对 Hermes 的**真实 import 点**（权威来源）可用
+> `grep -rn "import run_agent\|from hermes_cli\|import hermes_constants" trade/ pre_install_check.py` 列出。
+
+## 断裂记录
+
+> 记录历史上 Hermes 哪些升级导致了兼容性问题，以及修复方式。
+
+| Hermes 版本 | 断裂点 | 影响 | 修复方式 |
+|------------|--------|------|---------|
+| 0.14.0 | `config["model"]` 从 dict 变为 str | `helpers.py` 和 `memory.py` 中 `model_cfg.get("provider")` 报 AttributeError | `_parse_model_config_str()` 兼容两种格式 |
+| 0.14.0 | `hermes_cli.models.name_to_models` 移除 | `memory.py` import 失败 | 改用 `_PROVIDER_MODELS` |
+| 0.14.0 | `run_agent.py` 从 `chefroger/hermes-agent` fork 迁移到上游 `NousResearch/hermes-agent` | pyproject.toml git 依赖指向旧 fork | 更新 git URL 指向 `NousResearch/hermes-agent` |
+| 上游 main（安装印章 0.21.5+9141，领先 tag 9141 commits） | `hermes_bootstrap.py` 引入「借用启动」：判定「当前解释器 ≠ Hermes store 解释器」后，把 `server.py` **重新 exec 到 Hermes 自带的 Python**（`%LOCALAPPDATA%\hermes\tools\python-3.14.7+...\python.exe`） | 那个解释器里没有 trade 包 → 子进程死在 `server.py:11 from trade.app import main`（`ModuleNotFoundError: No module named 'trade'`，退出码 1）→ 父进程 `raise RelaunchExit(1)`。**`RelaunchExit` 继承 `SystemExit`**，而 `chat.py` 的重试循环只捕 `Exception` → agent 线程静默死亡（`Future exception was never retrieved`）→ 前端既收不到 `response` 也收不到 `error` → 只显示「⚠️ Agent 未返回有效回复」。**注意：单纯 `import run_agent` 不报错**（relaunch 到 store python 后能成功，只是白跑一遍），只有重新执行 server.py 才炸 —— 所以安装验证（`/api/status`、providers、面板）全部通过，一聊天就废。 | ① `trade/bootstrap.py:load_env_and_set_yolo()` 设 `HERMES_DISABLE_LAZY_INSTALLS=1`（上游正式的 sealed-venv 开关，见 Hermes `tools/lazy_deps.py`；作用域仅限 路路通ai助手 进程树，不影响用户自己的 `hermes` CLI）；② `install.sh` / `install.ps1` 生成的启动器里再设一次（**必须写进生成器** —— `trade.cmd` 是 install.ps1 的产物，手改会被重装抹掉）；③ `trade/api/chat.py` 补捕 `BaseException` 并取出 `agent_task.exception()` 上报，让这类失败不再变哑。 |

@@ -1,0 +1,19 @@
+# 路路通ai助手 — Web 服务运行依赖（本地 / 云部署共用）
+# 说明：这是上游 requirements.txt 的 Web 服务子集，仅用于直接启动 FastAPI 应用。
+# 上游完整依赖（AI 引擎、文档解析、OSINT、桌面副驾等）仍保留在 requirements.txt，
+# 按 README 的完整安装流程安装时行为不变。
+fastapi>=0.104.0,<1.0
+uvicorn[standard]>=0.24.0,<1.0
+python-multipart>=0.0.9
+pyyaml>=6.0
+packaging>=23.0
+pydantic>=2.0
+# 许可证 Ed25519 验签
+cryptography>=41.0
+# 进程管理 / DNS / 文档表格 / HTTP 客户端 / PDF 页探测
+psutil>=5.9.0,<8.0
+dnspython>=2.6.0,<3.0
+openpyxl>=3.1.0
+httpx>=0.27
+pymupdf>=1.24.0
+beautifulsoup4>=4.12.0

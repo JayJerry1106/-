@@ -1,0 +1,141 @@
+# -*- mode: python ; coding: utf-8 -*-
+# PyInstaller spec — 路路通ai助手 standalone app
+#
+# Build:
+#   pip install pyinstaller
+#   pyinstaller pyinstaller.spec
+#
+# Output: dist/路路通ai助手.app (macOS) / dist/ (Windows)
+
+import sys
+from pathlib import Path
+
+_block_cipher = None
+
+# project root
+ROOT = Path(SPECPATH)  # SPECPATH = directory where this .spec file lives
+
+# files to bundle with the app — 整个 static/ 目录（html + js + css + 图标）。
+# 以前只捆了 trade_chat.html，HTML 里引用的 /static/trade_chat.js 必然 404，
+# 打出来的包界面是空的（2026-10-25 审计 P1-11）。
+_static_files = []
+_static_dir = ROOT / "static"
+if _static_dir.is_dir():
+    for _f in _static_dir.rglob("*"):
+        if _f.is_file():
+            _static_files.append((str(_f), str(_f.parent.relative_to(ROOT))))
+
+# 版本号从 pyproject.toml 读，避免与主工程漂移
+_app_version = "0.0.0"
+try:
+    import tomllib
+
+    with open(ROOT / "pyproject.toml", "rb") as _pf:
+        _app_version = tomllib.load(_pf)["project"]["version"]
+except Exception:
+    pass
+_skill_files = []
+_skills_dir = ROOT / "skills"
+if _skills_dir.is_dir():
+    for _skill_d in _skills_dir.iterdir():
+        if _skill_d.is_dir() and _skill_d.name.startswith("b2b-"):
+            _skill_md = _skill_d / "SKILL.md"
+            if _skill_md.is_file():
+                _skill_files.append((str(_skill_md), f"skills/{_skill_d.name}"))
+# also add chat-memory skill
+_chat_skill = _skills_dir / "chat-memory" / "SKILL.md"
+if _chat_skill.is_file():
+    _skill_files.append((str(_chat_skill), "skills/chat-memory"))
+
+_template_files = []
+_template_dir = ROOT / ".trade-template"
+if _template_dir.is_dir():
+    for _f in _template_dir.rglob("*"):
+        if _f.is_file():
+            _dest = str(_f.relative_to(ROOT))
+            _template_files.append((str(_f), str(_f.parent.relative_to(ROOT))))
+
+# hidden imports that PyInstaller may miss
+_hidden_imports = [
+    "trade", "trade.api", "trade.api.companies", "trade.api.onboarding",
+    "trade.api.libraries", "trade.api.customers", "trade.api.conversations",
+    "trade.api.chat", "trade.api.memory", "trade.api.deps",
+    "trade.osint", "trade.osint.constants", "trade.osint.whois",
+    "trade.osint.email_verify", "trade.osint.sanctions",
+    "trade.osint.tech_stack", "trade.osint.linkedin_verify",
+    "trade.osint.scoring", "trade.osint.orchestrator",
+    "trade.database", "trade.company", "trade.library",
+    "trade.customer", "trade.chat_memory", "trade.memory",
+    "trade.helpers", "trade.prompt", "trade.prompts",
+    "trade.skill_router", "trade.skill_registry",
+    "trade.onboarding", "trade.email_intel", "trade.post_install",
+    "hermes_cli", "hermes_cli.config", "hermes_cli.auth",
+    "hermes_cli.env_loader", "hermes_cli.models",
+    "hermes_constants", "run_agent",
+    "openai", "anthropic",  # LLM Provider SDKs — required, not optional
+    "pymupdf", "anydoc", "pypdfium2",  # 文档解析 / 图纸渲染（扫描件走 vision）
+    "psutil", "dnspython",  # Process management / DNS lookups
+    "fastapi", "uvicorn", "uvicorn.loops", "uvicorn.loops.auto",
+    "uvicorn.protocols", "uvicorn.protocols.http",
+    "uvicorn.protocols.http.auto", "uvicorn.protocols.websockets",
+    "uvicorn.protocols.websockets.auto",
+    "starlette", "pydantic", "anyio", "yaml",
+]
+
+a = Analysis(
+    [str(ROOT / "server.py")],
+    pathex=[str(ROOT), str(ROOT / "trade")],
+    binaries=[],
+    datas=_static_files + _skill_files + _template_files,
+    hiddenimports=_hidden_imports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        "tkinter", "matplotlib", "pandas", "numpy", "scipy",
+        "PIL", "cv2", "tensorflow", "torch", "sklearn",
+        "jedi", "ipython", "jupyter", "notebook",
+        "pytest", "coverage", "flake8",
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=_block_cipher,
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=_block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    [],
+    name="路路通ai助手",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=str(ROOT / "static" / "icon.icns") if (ROOT / "static" / "icon.icns").is_file() else None,
+)
+
+app = BUNDLE(
+    exe,
+    name="路路通ai助手.app",
+    icon=str(ROOT / "static" / "icon.icns") if (ROOT / "static" / "icon.icns").is_file() else None,
+    bundle_identifier="com.foreign-trade.assistant",
+    info_plist={
+        "NSHighResolutionCapable": True,
+        "CFBundleShortVersionString": _app_version,
+        "CFBundleName": "路路通ai助手",
+        "LSBackgroundOnly": False,
+        "NSSupportsAutomaticGraphicsSwitching": True,
+    },
+)

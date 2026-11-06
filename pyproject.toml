@@ -1,0 +1,155 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lulutong-ai-assistant"
+version = "0.7.7"
+description = "路路通ai助手 — AI sales assistant for B2B trade companies. Lead generation, customer due diligence, document analysis, social media, and daily automation."
+readme = "README.md"
+# 注意：**不要**因为「部署必须用 Python 3.14」就把这里抬到 >=3.14。
+# 3.14 是**部署约束**（Trade 进程内嵌 Hermes，必须与 Hermes 的托管环境同 ABI），
+# 不是 Trade 代码本身的约束 —— Trade 的代码仍兼容 3.11，CI 也在 3.11–3.13 上跑。
+# 该约束由 scripts/install.sh / install.ps1 的 Step 1 强制（只接受 3.14），
+# 详见 COMPATIBILITY.md 的「当前策略」。
+requires-python = ">=3.11"
+authors = [{ name = "Roger Lococo" }]
+license = { text = "AGPL-3.0-only" }
+dependencies = [
+  # Core
+  "fastapi>=0.104.0,<1.0",
+  "uvicorn[standard]>=0.24.0,<1.0",
+  "python-multipart>=0.0.9,<1.0",
+  # Explicit — needed for SKILL.md frontmatter parsing and version checks
+  "pyyaml>=6.0,<7.0",
+  "packaging>=23.0,<27.0",
+  # Hermes Agent — NOT declared here on purpose.
+  # Hermes's setup.py refuses to build wheels/sdists for pip ("Building wheels or
+  # sdists for hermes-agent is not supported"); declaring it makes `pip install`
+  # fail outright. It is installed separately as an editable checkout by
+  # scripts/install.sh (Step 2), and Trade installs itself with --no-deps.
+  # Pinned version: v2026.9.24 — new installs clone this tag; see COMPATIBILITY.md. The installed
+  # version is enforced at runtime by pre_install_check.py and
+  # bootstrap.check_hermes_version().
+  # LLM Provider SDKs — Hermes uses openai SDK as universal HTTP wire format
+  # for ALL providers (DeepSeek / OpenAI / GLM / Kimi / OpenRouter / etc.),
+  # and anthropic SDK for native Anthropic provider. Both are REQUIRED, not optional.
+  "openai==2.24.0",
+  "anthropic==0.87.0",
+  # Document extraction — REQUIRED, not optional. Hermes uses this to parse PDF
+  # and legacy Office files. Without it Hermes decodes PDFs as plain text (garbage,
+  # no error), so trade users silently get unusable output. Declared here as well as
+  # in Hermes' own dependencies so every install/upgrade path is covered; keep the
+  # pin in lockstep with Hermes tools/lazy_deps.py.
+  "firecrawl-anydoc==0.2.4",
+  # PDF page-level probing. Hermes prefers poppler's `pdftotext` (a system package) and
+  # falls back to pypdfium2 when it is absent — without either, page counts and
+  # scanned-page detection degrade to "unknown" and PDFs can never be verified.
+  # Pure-wheel, no system libraries.
+  "pypdfium2>=4.30.0,<6.0",
+  # NOTE: scanned pages / images are read through the vision path (see trade/tech_drawing.py
+  # and Hermes vision_analyze). Tesseract was dropped: it needs a separate system install
+  # while the recommended DeepSeek Flash model already reads images, and one OCR path keeps
+  # results consistent.
+  # Document extraction (used by read_file tool in Hermes)
+  # These are OPTIONAL — install with `pip install -e ".[docs]"` if you need document parsing
+  "beautifulsoup4>=4.12.0,<5.0",
+  # Process management — PID verification in _perform_restart
+  # hermes-agent requires psutil==7.2.2, so upper bound must accommodate that
+  "psutil>=5.9.0,<8.0",
+  # DNS resolution — MX record queries in OSINT email verification
+  "dnspython>=2.6.0,<3.0",
+  # 聊天副驾 capture（2026-10-23 §10 批准清单）。全部懒加载：缺失时副驾
+  # 显示"不可用（缺依赖）"，trade 主功能照常运行。
+  "mss>=9.0,<11",
+  "pyperclip>=1.8,<2",
+  # 全局热键 / 托盘（2026-11-05 负责人决定：默认安装；运行时仍惰性加载，
+  # 导入失败只降级对应能力，不阻断 Trade）。
+  "pynput>=1.7,<2",
+  "pystray>=0.19,<1",
+  # macOS 窗口截图（Quartz / ImageIO）。只装 darwin，避免拉进 Windows/Linux。
+  "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+  # Email-registration checks (OSINT Layer 1: 122 platforms) — REQUIRED.
+  # Missing → the layer is silently skipped (the report discloses it, but one
+  # evidence source is gone). Pure Python, installs on all three platforms;
+  # its httpx matches Hermes' pin (0.28.1), so no conflict. Trade runs it in a
+  # subprocess (holehe uses trio, incompatible with asyncio) with a 120s timeout.
+  "holehe>=1.61,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<10.0",
+  "pytest-asyncio>=0.23.0,<2.0",
+  "httpx>=0.27.0,<1.0",
+  "ruff>=0.5.0,<1.0",
+  "coverage[toml]>=7.4.0,<8.0",
+]
+docs = [
+  "pymupdf>=1.24.0,<2.0",
+  "openpyxl>=3.1.0,<4.0",
+  "python-docx>=1.1.0,<2.0",
+  "python-pptx>=1.0.0,<2.0",
+  "xlrd>=2.0.0,<3.0",
+]
+desktop = [
+  "pywebview>=5.0",
+  "pyinstaller>=6.0",
+]
+semantic = [
+  # 语义检索（优化路线 P0-2）：sqlite-vec 是 SQLite 向量扩展，
+  # 纯本地、无服务器。缺失时 trade.vec_search 自动降级为关键词检索，
+  # 故为 optional 而非 required。安装：pip install -e ".[semantic]"
+  "sqlite-vec>=0.1.6",
+]
+
+[project.scripts]
+# 指向**包内**入口：原先写 server:main，而 server.py 在仓库根、不被打包，
+# pip 安装后 `trade` 命令会 ModuleNotFoundError（且 server.py 无守卫，
+# `from server import main` 会连带执行启动流程）。trade.cli 做 setup() + app.main()。
+trade = "trade.cli:run_server"
+# Installs Trade skills into Hermes at package install time.
+# Copies skills/b2b-* to ~/.hermes/skills/b2b/ so Hermes can discover them.
+install-trade-skills = "trade.post_install:install_skills"
+# Update B2B skills from GitHub (fetches latest SKILL.md from main branch)
+trade-skills-update = "trade.post_install:update_skills"
+# Update entire Trade system (git pull + pip install + skills + db)
+trade-update = "trade.post_install:update_trade"
+# Backup Trade data to tar.gz
+trade-backup = "trade.post_install:backup_trade"
+trade-restore = "trade.post_install:restore_trade"
+tradewin = "tradewin:main"
+
+[tool.setuptools]
+# tradewin 是仓库根的桌面启动器（.spec 也按路径引用它），必须声明为顶层模块，
+# 否则 console script `tradewin = tradewin:main` 装完即 ModuleNotFoundError。
+# server.py 不需要声明：`python server.py` 按路径运行，脚本入口已改为 trade.cli:run_server。
+py-modules = ["tradewin"]
+
+[tool.setuptools.packages.find]
+include = ["trade", "trade.*"]
+
+# Include skills as package data so post_install can read them
+[tool.setuptools.package-data]
+trade = ["py.typed"]
+# chat-memory 插件的 manifest 是数据文件，必须显式声明 —— 否则 wheel 里缺 plugin.yaml，
+# 而 sync_chat_memory_plugin() 是靠"整个目录的文件 hash 集合是否相等"判断要不要重写的，
+# 缺文件就会被判成"需要部署"，于是每次启动都重写一遍（幂等性失效）。
+"trade.hermes_chat_memory_plugin" = ["*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "C4", "UP", "N"]
+ignore = ["E501", "E402", "B904", "N806", "E741", "F601"]  # pragmatic: non-blocking lint rules
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # re-export 场景允许
+"tests/*.py" = ["N802", "N803"]  # 测试函数名允许大写开头
